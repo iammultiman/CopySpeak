@@ -23,6 +23,7 @@
   import { syncSaveBarOrAutoSave, flushAutoSave } from "$lib/stores/auto-save.svelte";
 
   import type { AppConfig, HudPosition } from "$lib/types";
+  import { RETRIGGER_MODE_OPTIONS } from "$lib/types";
 
   let localConfig = $state<AppConfig | null>(null);
   let originalConfig = $state<AppConfig | null>(null);
@@ -33,11 +34,10 @@
 
   let isScrolling = $state(false);
 
-  const retriggerModeOptions = [
-    { value: "stop", label: $_("settings.playback.stopAndRestart") },
-    { value: "queue", label: $_("settings.playback.queueAfterCurrent") },
-    { value: "ignore", label: $_("settings.playback.ignoreNewTrigger") }
-  ];
+  const retriggerModeOptions = RETRIGGER_MODE_OPTIONS.map((option) => ({
+    value: option.value,
+    label: $_(option.labelKey)
+  }));
 
   const HUD_OPTIONS = [
     { value: "disabled", label: "Disabled" },

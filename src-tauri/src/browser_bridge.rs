@@ -46,6 +46,24 @@ const MAX_FRAME: usize = 256 * 1024;
 const NO_FRAGMENT: usize = usize::MAX;
 /// How often the state ticker re-evaluates the projected word.
 const TICK_MS: u64 = 50;
+/// Serial for the per-session reading id. The id must be unique per *session*,
+/// not per request: the client owns `request_id` and can legitimately repeat it,
+/// and a repeated id would otherwise replace a live session in the map without
+/// the retire step noticing — leaving an old ticker and synthesis task holding
+/// the same id, so an old reading's reports and terminal frame could be applied
+/// to the new one.
+static SESSION_SERIAL: AtomicU64 = AtomicU64::new(1);
+/// How long a failed reading may wait for the frontend to report its terminal
+/// state before the session is reaped. Only a live renderer reports it, so this
+/// bounds the case where the renderer was closed or crashed mid-drain.
+const FRONTEND_LEASE_MS: u64 = 30_000;
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Lifecycle status, stored as u8 so it can live in an AtomicU8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +136,16 @@ struct BrowserSession {
     position_ms: AtomicU64,
     status: AtomicU8,
     cancelled: AtomicBool,
+    /// Set once the frontend has received audio for this reading (covers buffered
+    /// fragments that are not audible yet), so a mid-article failure keeps the
+    /// companion bar until they drain.
+    delivered: AtomicBool,
+    /// Unix ms of the last frontend contact (its audible-clock report).
+    frontend_live: AtomicU64,
+    /// Set when the reading failed after audio was emitted, so the frontend owns
+    /// the terminal state. The ticker reaps the session via `frontend_live` if
+    /// that report never arrives.
+    awaiting_drain: AtomicBool,
     /// Unix only: the connected host stream, so the state ticker can push
     /// `state` frames on the session's own socket (Windows projects through
     /// the global pipe handle instead).
@@ -417,7 +445,15 @@ fn handle_fragment_event(app: &AppHandle, payload: &str) {
         }
     });
     if let Some(index) = index {
-        record_fragment_captions(app, index, text, captions);
+        // This runs on the emitting thread inside `emit`, so the reading is
+        // marked as having produced audio *before* a later synthesis failure is
+        // classified — the order the deferral depends on.
+        let delivered = !event
+            .get("audio_base64")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty();
+        record_fragment_captions(app, event.get("browser_reading_id").and_then(Value::as_str), index, text, captions, delivered);
     }
 }
 
@@ -439,26 +475,57 @@ fn handle_stream_chunk_event(app: &AppHandle, payload: &str) {
         }
     });
     if let Some(index) = index {
-        record_fragment_captions(app, index, text, captions);
+        // A caption-only chunk (metadata with no PCM) is not delivered audio.
+        let delivered = !event
+            .get("audio_base64")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty();
+        record_fragment_captions(app, event.get("browser_reading_id").and_then(Value::as_str), index, text, captions, delivered);
     }
 }
 
 fn record_fragment_captions(
     app: &AppHandle,
+    browser_reading_id: Option<&str>,
     index: usize,
     text: Option<&str>,
     captions: Option<CaptionAlignment>,
+    delivered: bool,
 ) {
     let bridge = app.state::<BrowserBridge>();
     let sessions = bridge.sessions.lock().unwrap();
-    // A single active browser session is the norm; project onto whichever
-    // session is live. The tile check below rejects foreign readings' text.
-    let Some(session) = sessions.values().next().cloned() else {
+    let Some(session) = browser_reading_id.and_then(|reading_id| sessions.get(reading_id)).cloned() else {
         return;
     };
     drop(sessions);
 
+    record_owned_fragment(&session, browser_reading_id, index, text, captions, delivered);
+}
+
+fn record_owned_fragment(
+    session: &BrowserSession,
+    browser_reading_id: Option<&str>,
+    index: usize,
+    text: Option<&str>,
+    captions: Option<CaptionAlignment>,
+    delivered: bool,
+) {
+    if browser_reading_id != Some(session.reading_id.as_str()) {
+        return;
+    }
+    if delivered {
+        session.delivered.store(true, Ordering::Relaxed);
+    }
     let mut fragments = session.fragments.lock().unwrap();
+    // Caption alignment is separate from ownership: transformed text may not
+    // match this tile, but audio with this session's ID was still delivered.
+    let Some(entry) = fragments.get(index) else {
+        return;
+    };
+    if text.is_some_and(|text| text != entry.expected_text) {
+        return;
+    }
     apply_fragment_event(&mut fragments, index, text, captions);
 }
 
@@ -709,10 +776,14 @@ fn handle_message(app: AppHandle, pipe: &SafeHandle, message: Value) -> Result<(
                     let _ = app.emit("playback-toggle-pause", ());
                 }
                 "stop" => {
-                    let _ = app.emit("playback-stop", ());
-                    // The playback store also reports the cancelled status via
-                    // browser_reading_finished; cancel eagerly here so the
-                    // session ends even if the webview is unresponsive.
+                    // The user stopped the reading from the page. Abort through
+                    // the shared path so synthesis actually stops (the CLI child
+                    // is killed) and playback halts, then end this session. The
+                    // generic `playback-stop` event alone is not enough: the
+                    // store deliberately ignores it while a browser reading has
+                    // produced no audio, so a silent reading would keep
+                    // synthesizing.
+                    crate::do_abort_synthesis(&app);
                     let session_arc = {
                         let sessions = bridge.sessions.lock().unwrap();
                         sessions.get(reading_id).cloned()
@@ -749,6 +820,30 @@ fn handle_message(app: AppHandle, pipe: &SafeHandle, message: Value) -> Result<(
     }
 
     Ok(())
+}
+
+/// End any browser session other than `keep`, so exactly one session is live.
+///
+/// Called when a new reading starts: a session left behind by a reconnect would
+/// otherwise stay registered and answer the new reading's progress and finish
+/// calls. Pass an id that is not yet inserted to retire everything.
+fn retire_existing_sessions(app: &AppHandle, keep: &str) {
+    let bridge = app.state::<BrowserBridge>();
+    let stale: Vec<Arc<BrowserSession>> = {
+        let sessions = bridge.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .filter(|(id, _)| id.as_str() != keep)
+            .map(|(_, session)| session.clone())
+            .collect()
+    };
+    for session in stale {
+        log::info!(
+            "[Browser] Retiring superseded session {}",
+            session.reading_id
+        );
+        finish_session(app, &session, SessionStatus::Cancelled);
+    }
 }
 
 /// Create the reading session, then trigger synthesis via speak_queued.
@@ -792,7 +887,16 @@ fn start_browser_reading(
             captions_ok: false,
         });
     }
-    let reading_id = format!("browser-{}", request_id);
+    let reading_id = format!(
+        "browser-{}-{}",
+        request_id,
+        SESSION_SERIAL.fetch_add(1, Ordering::Relaxed)
+    );
+
+    // Enforce a single active session. The extension opens one reading at a time,
+    // but a reconnect can leave the previous session registered; without this the
+    // retire is ambiguous and an old session could keep serving a new reading.
+    retire_existing_sessions(&app, &reading_id);
 
     let session = Arc::new(BrowserSession {
         reading_id: reading_id.clone(),
@@ -804,6 +908,9 @@ fn start_browser_reading(
         position_ms: AtomicU64::new(0),
         status: AtomicU8::new(SessionStatus::Buffering as u8),
         cancelled: AtomicBool::new(false),
+        delivered: AtomicBool::new(false),
+        frontend_live: AtomicU64::new(unix_ms()),
+        awaiting_drain: AtomicBool::new(false),
         #[cfg(not(target_os = "windows"))]
         stream: Mutex::new(Some(pipe.clone())),
     });
@@ -815,8 +922,13 @@ fn start_browser_reading(
         .insert(reading_id.clone(), session.clone());
 
     // Tell the frontend a browser reading is active so the playback store
-    // reports audible-clock positions to us.
-    let _ = app.emit("browser-reading", json!({ "active": true }));
+    // reports audible-clock positions to us. The reading id is carried so every
+    // later report resolves to THIS session: a delayed report from a replaced
+    // reading must not be applied to the replacement.
+    let _ = app.emit(
+        "browser-reading",
+        json!({ "active": true, "reading_id": reading_id.clone() }),
+    );
 
     // Send acceptance.
     send_accepted(pipe, &request_id, &reading_id)?;
@@ -838,7 +950,7 @@ fn start_browser_reading(
         let queue: State<Mutex<crate::fragment_queue::FragmentQueue>> = app_clone.state();
         let telemetry_state: State<Mutex<crate::telemetry::TelemetryLog>> = app_clone.state();
 
-        let result = crate::commands::speak_queued(
+        let result = crate::commands::speak_queued_with_owner(
             app_clone.clone(),
             config,
             player,
@@ -846,6 +958,7 @@ fn start_browser_reading(
             queue,
             telemetry_state,
             Some(text_clone),
+            Some(reading_id_clone.clone()),
         )
         .await;
 
@@ -857,7 +970,19 @@ fn start_browser_reading(
                 sessions.get(&reading_id_clone).cloned()
             };
             if let Some(session) = session_arc {
-                finish_session(&app_clone, &session, SessionStatus::Error);
+                if failed_reading_end_is_immediate(&session) {
+                    finish_session(&app_clone, &session, SessionStatus::Error);
+                } else {
+                    // Audio is already audible, so the companion bar and the
+                    // word highlights must stay up while the buffered fragments
+                    // finish speaking. The playback store reports the terminal
+                    // state from `finishPlayback`; the ticker reaps the session
+                    // if that report never arrives (see `FRONTEND_LEASE_MS`).
+                    // `finish_session` is first-wins via `cancelled`, so
+                    // whichever path fires first decides and the other is a
+                    // no-op.
+                    session.awaiting_drain.store(true, Ordering::Relaxed);
+                }
             }
         }
     });
@@ -865,22 +990,31 @@ fn start_browser_reading(
     Ok(())
 }
 
-/// Frontend audible-clock progress for the active browser reading.
+/// Frontend audible-clock progress for a browser reading.
+///
+/// Resolved by reading id: a delayed report from a replaced reading must not
+/// move the replacement's clock or refresh its liveness lease.
 #[tauri::command]
 pub async fn browser_reading_progress(
     app: AppHandle,
+    reading_id: String,
     fragment_index: usize,
     position_ms: u64,
     paused: bool,
 ) -> Result<(), String> {
     let bridge = app.state::<BrowserBridge>();
-    let sessions = bridge.sessions.lock().unwrap();
-    let Some(session) = sessions.values().next().cloned() else {
+    let session = {
+        let sessions = bridge.sessions.lock().unwrap();
+        sessions.get(&reading_id).cloned()
+    };
+    let Some(session) = session else {
         return Ok(());
     };
-    drop(sessions);
 
     session.position_ms.store(position_ms, Ordering::Relaxed);
+    // Refresh the liveness lease: the frontend is still reporting this reading,
+    // so a failed session waiting to drain must not be reaped under it.
+    session.frontend_live.store(unix_ms(), Ordering::Relaxed);
     session
         .active_fragment
         .store(fragment_index, Ordering::Relaxed);
@@ -900,20 +1034,88 @@ pub async fn browser_reading_progress(
 }
 
 /// Frontend reports the reading reached a terminal state.
+///
+/// Resolved by reading id so a late finish from a replaced reading cannot end
+/// the session that replaced it.
+///
+/// A `completed`/`cancelled` report for a reading that never delivered audio is
+/// ignored: starting a new reading in Interrupt mode aborts the previous
+/// playback, and that teardown's completion arrives while the new reading is
+/// still silent. An explicit user stop ends the session through
+/// `end_active_browser_reading` instead (the backend knows which aborts the user
+/// asked for), and an error is always reported because a section failure is real
+/// news.
 #[tauri::command]
-pub async fn browser_reading_finished(app: AppHandle, status: String) -> Result<(), String> {
+pub async fn browser_reading_finished(
+    app: AppHandle,
+    reading_id: String,
+    status: String,
+) -> Result<(), String> {
     let session_status = match status.as_str() {
         "completed" => SessionStatus::Completed,
+        "error" => SessionStatus::Error,
         _ => SessionStatus::Cancelled,
     };
     let bridge = app.state::<BrowserBridge>();
-    let sessions = bridge.sessions.lock().unwrap();
-    let Some(session) = sessions.values().next().cloned() else {
+    let session = {
+        let sessions = bridge.sessions.lock().unwrap();
+        sessions.get(&reading_id).cloned()
+    };
+    let Some(session) = session else {
         return Ok(());
     };
-    drop(sessions);
+    // `delivered` is written on the emitting thread by the audio listeners, so it
+    // is already set if this reading ever produced audio.
+    if !should_finish_on_report(&session, session_status) {
+        log::info!(
+            "[Browser] Ignoring {:?} for silent reading {} (superseded, not a user stop)",
+            session_status,
+            session.reading_id
+        );
+        return Ok(());
+    }
     finish_session(&app, &session, session_status);
     Ok(())
+}
+
+/// Whether a frontend terminal report may end the session.
+///
+/// An error always may: a section failure is real news, and the user needs the
+/// desktop toast and the extension badge. A `completed`/`cancelled` report may
+/// only once this reading has delivered audio — otherwise it was produced by the
+/// teardown of a reading this one replaced, not by this reading finishing.
+fn should_finish_on_report(session: &BrowserSession, status: SessionStatus) -> bool {
+    status == SessionStatus::Error || session.delivered.load(Ordering::Relaxed)
+}
+
+/// End the active browser reading because the user explicitly stopped it.
+///
+/// Called only by the user-initiated stop commands (`stop_speaking`,
+/// `abort_synthesis`, the tray abort). A retrigger also aborts the previous
+/// playback, but it must not end the reading that is replacing it, so the shared
+/// `do_abort_synthesis` deliberately does not call this.
+pub fn end_active_browser_reading(app: &AppHandle, status: SessionStatus) {
+    let bridge = app.state::<BrowserBridge>();
+    let sessions: Vec<Arc<BrowserSession>> = {
+        let guard = bridge.sessions.lock().unwrap();
+        guard.values().cloned().collect()
+    };
+    for session in sessions {
+        finish_session(app, &session, status);
+    }
+}
+
+/// Whether a failed reading must end its browser session right now.
+///
+/// Only when nothing was ever audible AND no audio was delivered. `delivered`
+/// covers the buffered-but-not-yet-audible case — a fragment that has reached
+/// the frontend but not started playing — where ending the session would still
+/// tear the bar down under audio that is about to speak. `active_fragment` is
+/// written solely by the frontend's audible-clock progress, so `NO_FRAGMENT`
+/// means nothing has played yet.
+fn failed_reading_end_is_immediate(session: &BrowserSession) -> bool {
+    !session.delivered.load(Ordering::Relaxed)
+        && session.active_fragment.load(Ordering::Relaxed) == NO_FRAGMENT
 }
 
 /// Push a terminal state, notify the frontend, and drop the session.
@@ -923,7 +1125,10 @@ fn finish_session(app: &AppHandle, session: &Arc<BrowserSession>, status: Sessio
         return;
     }
     session.status.store(status as u8, Ordering::Relaxed);
-    let _ = app.emit("browser-reading", json!({ "active": false }));
+    let _ = app.emit(
+        "browser-reading",
+        json!({ "active": false, "reading_id": session.reading_id }),
+    );
 
     let bridge = app.state::<BrowserBridge>();
     let seq = session.sequence.fetch_add(1, Ordering::Relaxed) + 1;
@@ -951,6 +1156,19 @@ fn spawn_state_ticker(app: AppHandle, session: Arc<BrowserSession>) {
         let mut last_reason: Option<Option<&'static str>> = None;
         loop {
             if session.cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            // A failed reading waits for the frontend to report its terminal
+            // state once the buffered audio drains. Only a live renderer can do
+            // that, so reap the session when its lease expires rather than
+            // leaving it registered to hijack the next reading's progress and
+            // finish calls.
+            if session.awaiting_drain.load(Ordering::Relaxed)
+                && unix_ms().saturating_sub(session.frontend_live.load(Ordering::Relaxed))
+                    > FRONTEND_LEASE_MS
+            {
+                log::warn!("[Browser] Frontend stopped reporting; ending the failed reading");
+                finish_session(&app, &session, SessionStatus::Error);
                 return;
             }
             let status_u8 = session.status.load(Ordering::Relaxed);
@@ -1162,6 +1380,17 @@ mod tests {
     use super::*;
     use crate::tts::captions::WordTiming;
 
+    #[test]
+    fn foreign_audio_cannot_claim_delivery_even_with_identical_text() {
+        let session = session_with("Hello.", "Hello.", vec![("Hello.", 0, 6)], None);
+        for owner in [None, Some("previous")] {
+            record_owned_fragment(&session, owner, 0, Some("Hello."), None, true);
+            assert!(!session.delivered.load(Ordering::Relaxed));
+        }
+        record_owned_fragment(&session, Some("r"), 0, Some("Hello."), None, true);
+        assert!(session.delivered.load(Ordering::Relaxed));
+    }
+
     fn word(text_start: usize, text_end: usize) -> WordTiming {
         WordTiming {
             text_start,
@@ -1205,9 +1434,70 @@ mod tests {
             position_ms: AtomicU64::new(0),
             status: AtomicU8::new(SessionStatus::Playing as u8),
             cancelled: AtomicBool::new(false),
+            delivered: AtomicBool::new(false),
+            frontend_live: AtomicU64::new(unix_ms()),
+            awaiting_drain: AtomicBool::new(false),
             #[cfg(not(target_os = "windows"))]
             stream: Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn a_silent_reading_is_not_ended_by_a_superseded_teardown() {
+        let session = session_with("Hello.", "Hello.", vec![("Hello.", 0, 6)], None);
+        // Never spoke: the completion/cancel belongs to the reading that
+        // replaced it, so it must not end this session.
+        session.delivered.store(false, Ordering::Relaxed);
+        assert!(!should_finish_on_report(&session, SessionStatus::Completed));
+        assert!(!should_finish_on_report(&session, SessionStatus::Cancelled));
+        // An error is always reported, so a section failure stays visible.
+        assert!(should_finish_on_report(&session, SessionStatus::Error));
+        // Once this reading has spoken, its own completion does end it.
+        session.delivered.store(true, Ordering::Relaxed);
+        assert!(should_finish_on_report(&session, SessionStatus::Completed));
+    }
+
+    #[test]
+    fn a_failed_reading_ends_immediately_only_before_any_audio_plays() {
+        let session = session_with("Hello.", "Hello.", vec![("Hello.", 0, 6)], None);
+        // Nothing audible and nothing delivered: an early failure has no bar or
+        // highlight to keep.
+        session
+            .active_fragment
+            .store(NO_FRAGMENT, Ordering::Relaxed);
+        session.delivered.store(false, Ordering::Relaxed);
+        assert!(failed_reading_end_is_immediate(&session));
+        // Audio was delivered but has not become audible yet (still buffered):
+        // the bar must stay up for the audio that is about to speak.
+        session.delivered.store(true, Ordering::Relaxed);
+        assert!(!failed_reading_end_is_immediate(&session));
+        // The first audible fragment is index 0; the store owns the terminal
+        // state instead of the bridge ending it here.
+        session.active_fragment.store(0, Ordering::Relaxed);
+        assert!(!failed_reading_end_is_immediate(&session));
+        session.delivered.store(false, Ordering::Relaxed);
+        assert!(!failed_reading_end_is_immediate(&session));
+    }
+
+    #[test]
+    fn a_deferred_reading_is_reaped_when_the_frontend_goes_quiet() {
+        let session = session_with("Hello.", "Hello.", vec![("Hello.", 0, 6)], None);
+        session.active_fragment.store(0, Ordering::Relaxed);
+        session.awaiting_drain.store(true, Ordering::Relaxed);
+        // A fresh contact keeps the session alive past its lease boundary.
+        session.frontend_live.store(unix_ms(), Ordering::Relaxed);
+        assert!(
+            unix_ms().saturating_sub(session.frontend_live.load(Ordering::Relaxed))
+                <= FRONTEND_LEASE_MS
+        );
+        // A stale contact (renderer closed mid-drain) is past the lease.
+        session
+            .frontend_live
+            .store(unix_ms().saturating_sub(FRONTEND_LEASE_MS + 1), Ordering::Relaxed);
+        assert!(
+            unix_ms().saturating_sub(session.frontend_live.load(Ordering::Relaxed))
+                > FRONTEND_LEASE_MS
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
   import { Slider } from "$lib/components/ui/slider/index.js";
   import { Switch } from "$lib/components/ui/switch/index.js";
   import type { AppConfig } from "$lib/types";
+  import { isRetriggerMode } from "$lib/types";
   import { _ } from "svelte-i18n";
 
   let {
@@ -39,7 +40,8 @@
       options={retriggerModeOptions}
       value={localConfig.playback.on_retrigger}
       onchange={(e) => {
-        localConfig.playback.on_retrigger = (e.target as HTMLSelectElement).value as any;
+        const next = (e.target as HTMLSelectElement).value;
+        if (isRetriggerMode(next)) localConfig.playback.on_retrigger = next;
       }}
       class="w-48"
     />

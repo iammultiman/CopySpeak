@@ -153,9 +153,28 @@ pub fn chunk_stream_from_speech(
 
 /// Collect the same native stream when playback is configured for batch mode.
 pub fn collect_speech(stream: ChunkStream) -> Result<super::captions::SpeechAudio, TtsError> {
+    collect_speech_cancellable(stream, || false)
+}
+
+pub fn collect_speech_cancellable(
+    stream: ChunkStream,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<super::captions::SpeechAudio, TtsError> {
     let mut pcm = Vec::new();
     let mut captions = None;
-    while let Some(item) = stream.recv() {
+    loop {
+        if is_cancelled() {
+            return Ok(Vec::new().into());
+        }
+        let item = match stream.recv_timeout(Duration::from_millis(100)) {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if is_cancelled() {
+            return Ok(Vec::new().into());
+        }
         match item {
             ChunkItem::Pcm(bytes) => pcm.extend_from_slice(&bytes),
             ChunkItem::Captions(value) => {
@@ -170,6 +189,9 @@ pub fn collect_speech(stream: ChunkStream) -> Result<super::captions::SpeechAudi
             ChunkItem::ClearCaptions => captions = None,
             ChunkItem::Failed(reason) => return Err(TtsError::Http(reason)),
         }
+    }
+    if is_cancelled() {
+        return Ok(Vec::new().into());
     }
     if pcm.is_empty() {
         return Err(TtsError::Http("Stream produced no audio".into()));
@@ -234,6 +256,39 @@ mod tests {
         .unwrap();
         assert_eq!(speech.bytes, bytes);
         assert_eq!(speech.captions, Some(captions));
+    }
+
+    #[test]
+    fn batch_collection_cancels_while_the_producer_is_silent() {
+        let (sender, receiver) = mpsc::channel();
+        let stream = ChunkStream::new(
+            AudioFormatMeta { sample_rate: 8000, channels: 1, bits_per_sample: 16 },
+            receiver,
+        );
+        let polls = std::cell::Cell::new(0);
+        let speech = collect_speech_cancellable(stream, || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        }).unwrap();
+        assert!(speech.bytes.is_empty());
+        assert!(sender.send(ChunkItem::Pcm(vec![0, 0])).is_err());
+    }
+
+    #[test]
+    fn batch_collection_discards_partial_audio_on_cancellation() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(ChunkItem::Pcm(vec![1, 2])).unwrap();
+        let stream = ChunkStream::new(
+            AudioFormatMeta { sample_rate: 8000, channels: 1, bits_per_sample: 16 },
+            receiver,
+        );
+        let polls = std::cell::Cell::new(0);
+        let speech = collect_speech_cancellable(stream, || {
+            polls.set(polls.get() + 1);
+            polls.get() >= 3
+        }).unwrap();
+        assert!(speech.bytes.is_empty());
+        assert!(speech.captions.is_none());
     }
 
     #[test]

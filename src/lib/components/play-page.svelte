@@ -276,6 +276,22 @@
     }
   }
 
+  async function handleTogglePause() {
+    // Own the toggle in exactly one place: the backend command emits
+    // "playback-toggle-pause", which the playback store listens for and applies
+    // to the audible player. Toggling the store here as well made the round-trip
+    // cancel itself out (pause, then immediately resume).
+    if (isTauri) {
+      try {
+        await invoke("toggle_pause");
+      } catch (error) {
+        console.error("Failed to toggle pause:", error);
+      }
+    } else {
+      playbackStore.handleTogglePause();
+    }
+  }
+
   // `fresh` skips the saved audio history already holds for this text.
   async function handleGenerate(fresh = false) {
     if (!isTauri) {
@@ -428,11 +444,13 @@
       <div class="flex flex-wrap items-center gap-2">
         <PlaybackControls
           {isPlaying}
+          isPaused={playbackStore.isPaused}
           isSynthesizing={playbackStore.isSynthesizing}
           {playMode}
           onPlay={handlePlay}
           onStop={handleStop}
           onAbort={handleAbort}
+          onTogglePause={handleTogglePause}
         />
         {#if manualText}
           <Button variant="ghost" onclick={() => (manualText = "")}>{$_("play.clear")}</Button>

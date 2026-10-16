@@ -1,6 +1,27 @@
-# Contributing to CopySpeak
+# Contributing to X-CopySpeak
 
-Thank you for your interest in contributing to CopySpeak! This guide will help you get started with contributing to this open source text-to-speech application.
+This guide covers the [X-CopySpeak fork](https://github.com/iammultiman/X-CopySpeak).
+The original [CopySpeak project](https://github.com/ilyaizen/CopySpeak) remains
+the upstream source; preserve its attribution and MIT license.
+
+Report fork-specific issues and propose changes in this fork. Review the
+[fork improvement ledger](issues-and-fixes.md) and [changelog](../CHANGELOG.md)
+before reporting an already-addressed issue. User-confirmed outcomes are recorded
+separately from automated checks.
+
+## Privacy Before Publishing
+
+Never commit credentials, private keys, personal contact details, local usernames,
+device identifiers, hardware descriptions tied to a person, absolute checkout
+paths, copied clipboard passages, settings exports, transcripts, or diagnostic
+logs. Use synthetic examples and generic path placeholders. Redact reports
+before posting them. Public repository URLs, upstream credits, generic platform
+paths, and public verification keys are not secrets.
+
+Local environments, downloaded installers, and diagnostic output belong in
+ignored directories. Ignore rules do not protect files already tracked; review
+the staged diff before committing. If a secret was published, revoke it first
+and coordinate history cleanup rather than assuming a deletion removes it.
 
 ## 📖 Philosophy
 
@@ -27,8 +48,8 @@ Before you begin, ensure you have the following installed:
 2. **Clone your fork**:
 
    ```bash
-   git clone https://github.com/ilyaizen/CopySpeak.git
-   cd CopySpeak
+   git clone https://github.com/iammultiman/X-CopySpeak.git
+   cd X-CopySpeak
    ```
 
 3. **Add upstream remote**:
@@ -75,9 +96,9 @@ CopySpeak follows a clean architecture pattern:
 
 ### Before Submitting a Bug Report
 
-1. **Search existing issues** at [github.com/ilyaizen/CopySpeak/issues](https://github.com/ilyaizen/CopySpeak/issues)
-2. **Check discussions** at [github.com/ilyaizen/CopySpeak/discussions](https://github.com/ilyaizen/CopySpeak/discussions)
-3. **Try the latest release** to see if the issue has been fixed
+1. **Search fork issues** at [github.com/iammultiman/X-CopySpeak/issues](https://github.com/iammultiman/X-CopySpeak/issues).
+2. **Check the fork improvement ledger** and linked upstream reports.
+3. **Try the latest available fork build** and identify its version and source.
 
 ### Submitting a Bug Report
 

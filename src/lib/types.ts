@@ -27,6 +27,8 @@ export type ValidationResult = ValidationError[];
 
 export type SupportedLocale = "en" | "es" | "ar" | "he";
 
+import type { TranslationKeys } from "$lib/i18n/types";
+
 export type HudPresetPosition =
   | "top-left"
   | "top-center"
@@ -38,6 +40,25 @@ export type HudPresetPosition =
 export type HudPosition = HudPresetPosition;
 
 export type RetriggerMode = "interrupt" | "queue";
+
+/** The two retrigger choices the backend enum accepts. */
+export const RETRIGGER_MODES: readonly RetriggerMode[] = ["interrupt", "queue"];
+
+/** Narrow an arbitrary string to a `RetriggerMode` without a type assertion. */
+export function isRetriggerMode(value: string): value is RetriggerMode {
+  return RETRIGGER_MODES.some((mode) => mode === value);
+}
+
+/** Selectable options for `PlaybackConfig.on_retrigger`. Values must match the
+ * Rust `RetriggerMode` serde representation (lowercase), or the backend rejects
+ * the whole config with `unknown variant`. */
+export const RETRIGGER_MODE_OPTIONS: readonly {
+  value: RetriggerMode;
+  labelKey: TranslationKeys;
+}[] = [
+  { value: "interrupt", labelKey: "settings.playback.stopAndRestart" },
+  { value: "queue", labelKey: "settings.playback.queueAfterCurrent" }
+];
 
 export interface TriggerConfig {
   listen_enabled: boolean;

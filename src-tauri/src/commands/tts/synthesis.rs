@@ -12,8 +12,8 @@ use crate::tts::stream::{pcm_to_wav, AudioFormatMeta, ChunkItem, ChunkStream};
 use crate::tts::TtsBackend;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::helpers::{
@@ -43,6 +43,26 @@ fn get_text_or_clipboard(text: Option<String>) -> Result<String, String> {
     }
 }
 
+/// Whether a new reading request must abort the one already in progress.
+///
+/// `on_retrigger` is enforced here rather than in the native Rodio player: the
+/// webview owns playback for every reading, so only this path can stop the
+/// audio the user actually hears.
+fn retrigger_interrupts(mode: &config::RetriggerMode) -> bool {
+    matches!(mode, config::RetriggerMode::Interrupt)
+}
+
+/// Whether a finished reading may publish its result — the Replay cache and the
+/// terminal `pagination:complete` event.
+///
+/// A reading that is no longer current must stay quiet. Its cached audio is a
+/// reading the user cancelled, and its completion event would tell the frontend
+/// the *replacement* has ended, finishing the replacement's still-empty queue
+/// before it has played anything.
+fn reading_may_publish(own_generation: u32, current_generation: u32) -> bool {
+    own_generation == current_generation
+}
+
 /// Log debug info for TTS operations
 fn log_tts_debug(tag: &str, backend: &str, text: &str) {
     if crate::logging::is_debug_mode() {
@@ -64,10 +84,268 @@ async fn synthesize_async(
     text: String,
     voice: String,
 ) -> Result<SpeechAudio, String> {
-    tokio::task::spawn_blocking(move || backend.synthesize_with_captions(&text, &voice))
-        .await
-        .map_err(|e| format!("Task join error: {e}"))?
-        .map_err(|e| e.to_string())
+    let generation = crate::ABORT_GENERATION.load(Ordering::SeqCst);
+    let cancelled = || crate::ABORT_REQUESTED.load(Ordering::Relaxed)
+        || generation != crate::ABORT_GENERATION.load(Ordering::SeqCst);
+    let result = retry_synthesis(
+        || {
+            let backend = backend.clone();
+            let text = text.clone();
+            let voice = voice.clone();
+            async move {
+                tokio::task::spawn_blocking(move || backend.synthesize_with_captions(&text, &voice))
+                    .await
+                    .map_err(|e| format!("Task join error: {e}"))?
+                    .map_err(|e| e.to_string())
+            }
+        },
+        cancelled, || true, Duration::from_millis(500),
+    ).await;
+    if cancelled() { Ok(Vec::new().into()) } else { result }
+}
+
+/// Wording for a section that could not be synthesized.
+///
+/// Pure so it can be asserted directly. The reading loop returns after this
+/// error, so this section and every later one are never spoken; the earlier
+/// wording ("No text was skipped") only described the *already synthesized*
+/// fragments and read as though the whole passage had been read.
+fn section_failure_message(index: usize, total: usize, error: &str) -> String {
+    if total <= 1 {
+        format!("Reading failed: {error}")
+    } else if index.saturating_add(1) >= total {
+        // The final section failed, so nothing follows it; claiming "the rest
+        // of the passage was not read" would describe text that does not exist.
+        // `saturating_add` keeps a defensive index from panicking in here.
+        format!(
+            "Reading stopped: the final section ({} of {}) failed. {error}",
+            index.saturating_add(1),
+            total
+        )
+    } else {
+        format!(
+            "Reading stopped: section {} of {} failed, so the rest of the passage was not read. {error}",
+            index + 1,
+            total
+        )
+    }
+}
+
+fn report_section_failure(
+    app: &AppHandle,
+    index: usize,
+    total: usize,
+    generation: u32,
+    error: String,
+) -> String {
+    let message = section_failure_message(index, total, &error);
+    if reading_may_publish(generation, crate::ABORT_GENERATION.load(Ordering::SeqCst))
+        && !crate::ABORT_REQUESTED.load(Ordering::Relaxed)
+    {
+        log::error!("[TTS] {message}");
+        let _ = app.emit("reading-failed", &message);
+    }
+    message
+}
+
+fn transient_synthesis_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    // Every condition is evaluated; a permanent code must not short-circuit the
+    // scan. edge-tts reports its real failure as
+    // `NoAudioReceived("No audio was received...")` next to the `403` from the
+    // refused handshake. The previous first-token-wins form read that `403`,
+    // returned "permanent", and never reached the phrase list below — so the
+    // transient no-audio failure was never retried.
+    let retryable_status = (message.contains("http")
+        || message.contains("status")
+        || message.contains("api error"))
+        && message
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| matches!(token, "429" | "500" | "502" | "503" | "504"));
+    if retryable_status {
+        return true;
+    }
+    ["timeout", "timed out",
+        "connection reset", "connection closed", "connection aborted",
+        "connection refused", "no audio was received", "daemon closed its output",
+        // reqwest's own transport failures. Its `Display` prints only the error
+        // kind ("error sending request"), so a timeout or a cut connection is
+        // recognised by the kind even when the reason chain is unavailable.
+        "error sending request", "request or response body error"]
+        .iter()
+        .any(|reason| message.contains(reason))
+}
+
+async fn retry_synthesis<T, Operation, Attempt, Cancelled, CanRetry>(
+    mut operation: Operation,
+    is_cancelled: Cancelled,
+    can_retry: CanRetry,
+    retry_delay: Duration,
+) -> Result<T, String>
+where
+    Operation: FnMut() -> Attempt,
+    Attempt: std::future::Future<Output = Result<T, String>>,
+    Cancelled: Fn() -> bool,
+    CanRetry: Fn() -> bool,
+{
+    for attempt in 0..3 {
+        if is_cancelled() {
+            return Err("Reading cancelled".into());
+        }
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if is_cancelled() {
+                    return Err("Reading cancelled".into());
+                }
+                if attempt == 2 || !can_retry() || !transient_synthesis_error(&error) {
+                    return Err(error);
+                }
+                log::warn!("[TTS] Transient synthesis failure; retry {}/2: {}", attempt + 1, error);
+                let deadline = tokio::time::Instant::now() + retry_delay * (attempt + 1);
+                while tokio::time::Instant::now() < deadline {
+                    if is_cancelled() {
+                        return Err("Reading cancelled".into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50).min(
+                        deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    )).await;
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[tokio::test]
+    async fn retries_transient_errors_without_skipping_text() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_synthesis(
+            || std::future::ready(if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err("HTTP error: 503 Service Unavailable".into())
+            } else { Ok("complete section") }),
+            || false, || true, Duration::ZERO,
+        ).await;
+        assert_eq!(result.unwrap(), "complete section");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn permanent_and_partially_played_failures_are_not_retried() {
+        for (error, can_retry) in [("401 Unauthorized", true), ("HTTP 503", false)] {
+            let attempts = AtomicUsize::new(0);
+            let result: Result<(), String> = retry_synthesis(
+                || { attempts.fetch_add(1, Ordering::SeqCst); std::future::ready(Err(error.into())) },
+                || false, || can_retry, Duration::ZERO,
+            ).await;
+            assert_eq!(result.unwrap_err(), error);
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_are_bounded_and_cancellation_prevents_another_attempt() {
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), String> = retry_synthesis(
+            || { attempts.fetch_add(1, Ordering::SeqCst); std::future::ready(Err("HTTP 429".into())) },
+            || false, || true, Duration::ZERO,
+        ).await;
+        assert_eq!(result.unwrap_err(), "HTTP 429");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let cancelled = AtomicBool::new(false);
+        let result: Result<(), String> = retry_synthesis(
+            || { cancelled.store(true, Ordering::SeqCst); std::future::ready(Err("HTTP 503".into())) },
+            || cancelled.load(Ordering::SeqCst), || true, Duration::ZERO,
+        ).await;
+        assert_eq!(result.unwrap_err(), "Reading cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_backoff_before_another_request() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            signal.store(true, Ordering::SeqCst);
+        });
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), String> = tokio::time::timeout(Duration::from_secs(1), retry_synthesis(
+            || { attempts.fetch_add(1, Ordering::SeqCst); std::future::ready(Err("HTTP 503".into())) },
+            || cancelled.load(Ordering::SeqCst), || true, Duration::from_secs(60),
+        )).await.unwrap();
+        cancel_task.await.unwrap();
+        assert_eq!(result.unwrap_err(), "Reading cancelled");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn status_classification_does_not_retry_permanent_or_incidental_numbers() {
+        // A permanent HTTP status is not retried on its own.
+        assert!(!transient_synthesis_error("HTTP 401 Unauthorized: invalid API key"));
+        assert!(!transient_synthesis_error("HTTP 403: voice model not found"));
+        assert!(!transient_synthesis_error("voice model 50300 was not found"));
+        assert!(!transient_synthesis_error("invalid transcript contains 503"));
+        assert!(transient_synthesis_error("HTTP error: Google API error 503 Service Unavailable"));
+        assert!(transient_synthesis_error("WSServerHandshakeError: 503 Invalid response status"));
+    }
+
+    #[test]
+    fn transient_signal_beats_a_coincidental_permanent_status() {
+        // The exact shape of the user's Edge failure: the refused handshake's
+        // 403 precedes the real no-audio error, and must not mask it.
+        assert!(transient_synthesis_error(
+            "edge-tts exit exit status: 1: NoAudioReceived(\"No audio was received. \
+             Please verify that your parameters are correct.\") status=403"
+        ));
+        // A retryable status counts wherever it appears in the string.
+        assert!(transient_synthesis_error("status 403 handled; upstream returned 503"));
+        // A provider status error need not say "http" or "status".
+        assert!(transient_synthesis_error(
+            "ElevenLabs API error 503 Service Unavailable: overloaded"
+        ));
+        // reqwest reports transport failures as a bare error kind.
+        assert!(transient_synthesis_error("Request failed: error sending request"));
+        assert!(transient_synthesis_error(
+            "Streaming synthesis failed mid-stream: request or response body error"
+        ));
+        assert!(transient_synthesis_error(
+            "Request failed: error sending request: operation timed out"
+        ));
+        // A response-body read failure keeps its cause in the flattened chain.
+        assert!(transient_synthesis_error(
+            "Failed to read bytes: request or response body error: connection reset by peer"
+        ));
+        // A local CLI `exit status: 1` is not itself a transient signal.
+        assert!(!transient_synthesis_error(
+            "edge-tts exit exit status: 1: ERROR: voice model not found"
+        ));
+    }
+
+    #[test]
+    fn failure_message_states_that_the_rest_was_not_read() {
+        let many = section_failure_message(3, 10, "HTTP 503 Service Unavailable");
+        assert!(many.contains("section 4 of 10"));
+        assert!(many.contains("the rest of the passage was not read"));
+        assert!(!many.contains("No text was skipped"));
+        // A single-section reading has no "section 1 of 1" to report.
+        assert_eq!(
+            section_failure_message(0, 1, "HTTP 503"),
+            "Reading failed: HTTP 503"
+        );
+    }
+
+    #[test]
+    fn failure_message_for_the_final_section_promises_no_further_text() {
+        let last = section_failure_message(4, 5, "HTTP 503");
+        assert!(last.contains("final section (5 of 5)"));
+        // Nothing follows the last section, so it must not claim a remainder.
+        assert!(!last.contains("the rest of the passage"));
+    }
 }
 
 /// Extract envelope with default fallback
@@ -116,28 +394,43 @@ fn add_history_with_metadata(
 }
 
 /// Emit audio-ready event with base64 encoded audio
-fn emit_audio_ready(app: &AppHandle, speech: &SpeechAudio, text: &str) {
-    emit_audio_fragment(app, speech, 0, 1, text.to_owned());
+fn emit_audio_ready(app: &AppHandle, speech: &SpeechAudio, text: &str, abort_generation: u32) {
+    emit_audio_fragment(app, speech, 0, 1, text.to_owned(), abort_generation, None);
 }
 
-/// Emit audio-fragment-ready event for streaming playback
+/// Emit audio-fragment-ready event for streaming playback.
+///
+/// `abort_generation` is the calling reading's own generation. The frontend
+/// enqueues `audio-fragment-ready` unconditionally (unlike `audio-stream-chunk`,
+/// which honours `_streamStopped`), so a fragment belonging to a reading the
+/// user replaced would play over the replacement. Checking the generation —
+/// not just `ABORT_REQUESTED`, which the replacement clears as it starts —
+/// keeps that cancelled audio out of the new reading.
 fn emit_audio_fragment(
     app: &AppHandle,
     speech: &SpeechAudio,
     index: usize,
     total: usize,
     text: String,
+    abort_generation: u32,
+    browser_reading_id: Option<&str>,
 ) {
     let wav_bytes = &speech.bytes;
-    if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
-        return;
-    }
     use base64::{engine::general_purpose, Engine as _};
     let encoded = general_purpose::STANDARD.encode(wav_bytes);
-    let is_final = index == total - 1;
+    // `total` is never 0 in practice; guard anyway so an empty fragment list
+    // cannot wrap `total - 1` into a bogus terminal marker.
+    let is_final = total == 0 || index + 1 >= total;
+    // Checked after the encode (which is slow, and takes longer for long
+    // fragments): a retrigger can land during it, leaving this fragment
+    // belonging to a reading the user replaced.
+    if !reading_may_publish(abort_generation, crate::ABORT_GENERATION.load(Ordering::SeqCst)) {
+        return;
+    }
     if let Err(e) = app.emit(
         "audio-fragment-ready",
         AudioFragmentEvent {
+            browser_reading_id: browser_reading_id.map(str::to_owned),
             audio_base64: encoded,
             fragment_index: index,
             fragment_total: total,
@@ -161,13 +454,19 @@ fn emit_audio_stream_chunk(
     text: Option<&str>,
     fragment_duration_ms: Option<u64>,
     captions: Option<&CaptionAlignment>,
+    abort_generation: u32,
+    browser_reading_id: Option<&str>,
 ) {
-    if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
-        return;
-    }
     use base64::{engine::general_purpose, Engine as _};
     let encoded = general_purpose::STANDARD.encode(pcm);
+    // Checked after the encode: a retrigger during it, or a replacement that has
+    // already cleared `ABORT_REQUESTED`, would otherwise let this chunk of a
+    // cancelled reading reach the new reading's scheduler.
+    if !reading_may_publish(abort_generation, crate::ABORT_GENERATION.load(Ordering::SeqCst)) {
+        return;
+    }
     let event = AudioStreamChunkEvent {
+        browser_reading_id: browser_reading_id.map(str::to_owned),
         audio_base64: encoded,
         sample_rate: meta.sample_rate,
         channels: meta.channels,
@@ -189,6 +488,12 @@ fn emit_audio_stream_chunk(
 /// `on_chunk(chunk_index, pcm, is_final)` fires once per received chunk plus a
 /// terminal `(n, &[], true)` end-of-stream marker. Returns the wrapped WAV
 /// bytes and time-to-first-audio in milliseconds.
+/// How long the drain waits for the next chunk before re-checking cancellation.
+/// A producer that stalls (a wedged daemon, a hung HTTP body) would otherwise
+/// block `recv()` forever, keeping the shared reading lock and delaying — or
+/// defeating — the replacement a retrigger asked for.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 fn drain_chunk_stream(
     stream: ChunkStream,
     mut on_chunk: impl FnMut(usize, &[u8], bool, Option<&CaptionAlignment>),
@@ -211,7 +516,14 @@ fn drain_chunk_stream(
             drop(stream);
             return Ok((Vec::new().into(), ttfa_ms.unwrap_or(0)));
         }
-        match stream.recv() {
+        // Poll rather than block so the check above runs even when no chunk is
+        // coming. A timeout is not an error: it just means nothing arrived yet.
+        let item = match stream.recv_timeout(DRAIN_POLL_INTERVAL) {
+            Ok(item) => item,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+        };
+        match item {
             Some(ChunkItem::Pcm(bytes)) => {
                 if ttfa_ms.is_none() {
                     ttfa_ms = Some(start.elapsed().as_millis() as u64);
@@ -249,6 +561,15 @@ fn drain_chunk_stream(
     if accumulated.is_empty() {
         log::error!("[TTS][stream] failed during receive: stream ended with no audio");
         return Err("Streaming synthesis produced no audio".to_string());
+    }
+
+    // The stream can end (EOF) just as an abort lands, so re-check before the
+    // terminal marker: it tells the player "no more audio is coming", which must
+    // not be armed for a reading that was replaced.
+    if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
+        log::info!("[TTS][stream] aborted at end-of-stream; suppressing terminal marker");
+        drop(stream);
+        return Ok((Vec::new().into(), ttfa_ms.unwrap_or(0)));
     }
 
     // Terminal end-of-stream marker so the frontend knows no more chunks follow.
@@ -293,9 +614,21 @@ async fn synthesize_streaming_and_emit(
     voice: String,
     fragment_index: usize,
     emit_final: bool,
+    abort_generation: u32,
+    browser_reading_id: Option<&str>,
 ) -> Result<SpeechAudio, String> {
-    let app = app.clone();
-    tokio::task::spawn_blocking(move || {
+    let browser_reading_id = browser_reading_id.map(str::to_owned);
+    let emitted_audio = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled = || crate::ABORT_REQUESTED.load(Ordering::Relaxed)
+        || abort_generation != crate::ABORT_GENERATION.load(Ordering::SeqCst);
+    let result = retry_synthesis(|| {
+        let app = app.clone();
+        let backend = backend.clone();
+        let text = text.clone();
+        let voice = voice.clone();
+        let emitted_audio = emitted_audio.clone();
+        let browser_reading_id = browser_reading_id.clone();
+        async move { tokio::task::spawn_blocking(move || {
         let opened_at = Instant::now();
         log::info!(
             "[TTS][stream] opening streaming synthesis ({} chars, voice '{}', fragment {})",
@@ -318,6 +651,9 @@ async fn synthesize_streaming_and_emit(
         let meta = stream.meta.clone();
         let mut pcm_bytes = 0u64;
         drain_chunk_stream(stream, |chunk_idx, pcm, is_final, captions| {
+            if !pcm.is_empty() {
+                emitted_audio.store(true, Ordering::SeqCst);
+            }
             pcm_bytes += pcm.len() as u64;
             if !is_final && chunk_idx == 0 {
                 log::info!(
@@ -344,12 +680,16 @@ async fn synthesize_streaming_and_emit(
                 (chunk_idx == 0).then_some(text.as_str()),
                 duration_ms,
                 captions,
+                abort_generation,
+                browser_reading_id.as_deref(),
             );
         })
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?
-    .map(|(wav, _ttfa_ms)| wav)
+    .map(|(wav, _ttfa_ms)| wav) }
+    }, cancelled, || !emitted_audio.load(Ordering::SeqCst), Duration::from_millis(500)).await;
+    if cancelled() { Ok(Vec::new().into()) } else { result }
 }
 
 /// Save audio to history storage and return path
@@ -460,14 +800,14 @@ fn find_cached_reading(
 
 /// Play audio that history already holds: no new entry, file or telemetry
 /// sample, since nothing was synthesized.
-fn replay_saved_audio(app: &AppHandle, speech: &SpeechAudio, text: &str) {
+fn replay_saved_audio(app: &AppHandle, speech: &SpeechAudio, text: &str, abort_generation: u32) {
     cache_audio(app, speech, text);
     hud::show_hud(
         app,
         extract_envelope_or_default(&speech.bytes),
         Some(text.to_string()),
     );
-    emit_audio_ready(app, speech, text);
+    emit_audio_ready(app, speech, text, abort_generation);
 }
 
 // ── speak_now ───────────────────────────────────────────────────────────────
@@ -555,19 +895,43 @@ async fn speak_now_internal(
     let text = get_text_or_clipboard(text)?;
     // Play page, hotkey, tray, selection and control server all land here;
     // unsanitized web text (tabs, NBSPs) breaks engine tokenizers like Kokoro's.
-    let text = {
+    // `on_retrigger` is read under the same lock because both need the config,
+    // and every one of those entry points must honour the setting exactly as
+    // double-copy does.
+    let (text, interrupt) = {
         let cfg = config.lock().unwrap();
-        crate::sanitize::sanitize_text(&text, &cfg.sanitization)
+        (
+            crate::sanitize::sanitize_text(&text, &cfg.sanitization),
+            retrigger_interrupts(&cfg.playback.on_retrigger),
+        )
     };
     if text.trim().is_empty() {
         return Err("Nothing to speak".into());
     }
 
+    // Honour `on_retrigger` before waiting on the shared synthesis lock. A
+    // running reading holds that lock for its whole duration, so aborting from
+    // inside it could only wait for the old reading to finish — the "queue
+    // after current" behaviour this setting exists to override.
+    // A replacement adopts the generation its own abort produced, so a second
+    // retrigger racing alongside cannot be mistaken for this call's own abort.
+    let abort_generation = if interrupt {
+        crate::do_abort_synthesis(&app)
+    } else {
+        crate::ABORT_GENERATION.load(Ordering::SeqCst)
+    };
+
     let lock_state = app.state::<tokio::sync::Mutex<()>>();
     let _queue_lock = lock_state.lock().await;
 
     // Clear any previous abort request
+    if abort_generation != crate::ABORT_GENERATION.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     crate::ABORT_REQUESTED.store(false, Ordering::Relaxed);
+    if abort_generation != crate::ABORT_GENERATION.load(Ordering::SeqCst) {
+        return Ok(());
+    }
 
     // Enter critical section for TTS synthesis
     let _synthesis_guard = SynthesisGuard::new(&app);
@@ -594,6 +958,12 @@ async fn speak_now_internal(
     // Optional LLM post-processing (e.g., Groq) — best-effort; falls back to
     // the input text on any failure so synthesis is never blocked.
     let text = crate::post_process::try_process(text, &post_process_config).await;
+    // The user may have hit Stop while the post-processor was running. Abort
+    // before spending time synthesizing audio nobody asked for any more.
+    if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
+        log::info!("[TTS] Aborted during post-processing; nothing to synthesize");
+        return Ok(());
+    }
     let _ = app.emit("reading-started", &text);
 
     log_tts_debug("TTS", &format!("{:?}", active_backend), &text);
@@ -659,21 +1029,25 @@ async fn speak_now_internal(
         // Pagination comes first even for streaming engines: bounded fragments
         // keep each request under the provider's input limit (OpenAI rejects
         // anything past 4096 characters). Each fragment then streams on its own,
-        // so long text is both accepted and low-latency.
-        let wav = synthesize_paginated(
+        // so long text is both accepted and low-latency. Batch fragments are
+        // emitted per fragment here, so the frontend must not also receive the
+        // concatenated audio (that would play the whole reading twice).
+        let (wav, fragments_emitted) = synthesize_paginated(
             &app,
             backend_arc.clone(),
             &text,
             &voice,
             &active_backend,
             &telemetry_state,
+            &pagination_config,
             &synthesis_start,
             estimated_ms,
             confidence,
             streaming_playback,
+            abort_generation,
         )
         .await?;
-        (wav, streaming_playback)
+        (wav, streaming_playback || fragments_emitted)
     } else if streaming_playback {
         let wav = synthesize_streaming_and_emit(
             &app,
@@ -682,12 +1056,20 @@ async fn speak_now_internal(
             voice.clone(),
             0,
             true,
+            abort_generation,
+            None,
         )
-        .await?;
+        .await
+        .map_err(|error| report_section_failure(&app, 0, 1, abort_generation, error))?;
         (wav, true)
     } else {
-        // Simple synthesis
-        let wav = synthesize_async(backend_arc.clone(), text.clone(), voice.clone()).await?;
+        // Simple synthesis. Short text, and any reading with pagination
+        // disabled, takes this branch instead of synthesize_paginated — so it
+        // needs the same reporting, or a failed hotkey/tray/selection reading
+        // stays silent (the caller only logs the returned error).
+        let wav = synthesize_async(backend_arc.clone(), text.clone(), voice.clone())
+            .await
+            .map_err(|error| report_section_failure(&app, 0, 1, abort_generation, error))?;
         (wav, false)
     };
 
@@ -696,6 +1078,17 @@ async fn speak_now_internal(
     // emitted synthesis-aborted, so there is nothing to save or play here.
     if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
         log::info!("[TTS] Synthesis aborted; nothing to play or save");
+        return Ok(());
+    }
+
+    // A retrigger can also land in the instant after the flag check above. This
+    // reading is no longer current then: publishing would cache cancelled audio
+    // (poisoning Replay) and emit it over the reading the user just started.
+    if !reading_may_publish(
+        abort_generation,
+        crate::ABORT_GENERATION.load(Ordering::SeqCst),
+    ) {
+        log::info!("[TTS] Reading replaced; nothing to play or save");
         return Ok(());
     }
 
@@ -730,11 +1123,12 @@ async fn speak_now_internal(
             &active_backend,
             &output_config,
             synthesis_ms,
+            abort_generation,
         );
     }
 
     if cache_hit {
-        replay_saved_audio(&app, &wav_bytes, &text);
+        replay_saved_audio(&app, &wav_bytes, &text, abort_generation);
         return Ok(());
     }
 
@@ -752,10 +1146,17 @@ async fn speak_now_internal(
         synthesis_ms,
         already_streamed,
         eff.voice_label.as_deref(),
+        abort_generation,
     )
 }
 
-/// Synthesize paginated text with progress updates
+/// Synthesize paginated text with progress updates.
+///
+/// Returns the concatenated [`SpeechAudio`] plus a flag reporting whether each
+/// fragment was already forwarded to the frontend as an `audio-fragment-ready`
+/// event. When the flag is set the caller must not emit the concatenated audio
+/// again, or the reading plays twice.
+#[allow(clippy::too_many_arguments)]
 async fn synthesize_paginated(
     app: &AppHandle,
     backend_arc: Arc<Box<dyn TtsBackend>>,
@@ -763,17 +1164,24 @@ async fn synthesize_paginated(
     voice: &str,
     active_backend: &crate::config::TtsEngine,
     telemetry_state: &State<'_, Mutex<telemetry::TelemetryLog>>,
+    pagination_config: &crate::config::PaginationConfig,
     synthesis_start: &Instant,
     _total_estimate: Option<u64>,
     _avg_confidence: f32,
     streaming: bool,
-) -> Result<SpeechAudio, String> {
-    let pagination_config = crate::config::PaginationConfig::default();
-    let fragments = pagination::paginate_text(text, &pagination_config);
+    abort_generation: u32,
+) -> Result<(SpeechAudio, bool), String> {
+    // Honour the user's configured fragment size. Falling back to the default
+    // here used to split every Play-page/hotkey/tray reading at 600 chars
+    // regardless of settings, and disagreed with find_cached_reading's lookup.
+    let fragments = pagination::paginate_text(text, pagination_config);
 
     if fragments.len() <= 1 {
-        // Only one fragment — fall back to normal synthesis
-        return if streaming {
+        // Only one fragment — fall back to normal synthesis. Routed through the
+        // same reporting as the loop below: a failure here used to return a raw
+        // error that double-copy only console.error'd, so a short passage that
+        // failed was silent.
+        let speech = if streaming {
             synthesize_streaming_and_emit(
                 app,
                 backend_arc.clone(),
@@ -781,11 +1189,17 @@ async fn synthesize_paginated(
                 voice.to_string(),
                 0,
                 true,
+                abort_generation,
+                None,
             )
             .await
         } else {
             synthesize_async(backend_arc.clone(), text.to_string(), voice.to_string()).await
-        };
+        }
+        .map_err(|error| {
+            report_section_failure(app, 0, fragments.len().max(1), abort_generation, error)
+        })?;
+        return Ok((speech, streaming));
     }
 
     log::info!(
@@ -803,11 +1217,16 @@ async fn synthesize_paginated(
     );
 
     let mut fragment_audio = Vec::new();
+    // Batch fragments are streamed to the frontend as they are synthesized so
+    // playback starts on fragment 1 instead of after the entire passage is
+    // rendered. `already_emitted` tracks whether the caller may still emit the
+    // concatenated audio (streaming backends emit their own PCM chunks).
+    let mut already_emitted = false;
     for (i, fragment) in fragments.iter().enumerate() {
         // Check for abort
         if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
             log::info!("[TTS] Pagination aborted by user");
-            return Ok(Vec::new().into());
+            return Ok((Vec::new().into(), true));
         }
 
         // Emit progress update
@@ -841,6 +1260,8 @@ async fn synthesize_paginated(
                 voice.to_string(),
                 i,
                 i + 1 == fragments.len(),
+                abort_generation,
+                None,
             )
             .await
         } else {
@@ -851,16 +1272,36 @@ async fn synthesize_paginated(
             )
             .await
         }
-        .map_err(|e| format!("Fragment {} synthesis failed: {}", i + 1, e))?;
+        .map_err(|error| report_section_failure(app, i, fragments.len(), abort_generation, error))?;
 
         if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
-            return Ok(Vec::new().into());
+            return Ok((Vec::new().into(), true));
         }
+
+        // Hand the finished fragment to the player immediately. The frontend
+        // queue plays fragments in order, so later ones simply wait their turn.
+        if !streaming {
+            if i == 0 {
+                hud::show_hud(app, extract_envelope_or_default(&frag_wav.bytes), Some(text.to_string()));
+            }
+            emit_audio_fragment(
+                app,
+                &frag_wav,
+                i,
+                fragments.len(),
+                fragment.text.clone(),
+                abort_generation,
+                None,
+            );
+            already_emitted = true;
+        }
+
         fragment_audio.push((frag_wav, fragment.text.clone()));
     }
 
-    crate::tts::captions::concat_speech(fragment_audio)
-        .map_err(|e| format!("Failed to concatenate audio fragments: {e}"))
+    let assembled = crate::tts::captions::concat_speech(fragment_audio)
+        .map_err(|e| format!("Failed to concatenate audio fragments: {e}"))?;
+    Ok((assembled, already_emitted))
 }
 
 /// Handle file output mode
@@ -874,8 +1315,21 @@ fn handle_file_output(
     active_backend: &crate::config::TtsEngine,
     output_config: &crate::config::OutputConfig,
     synthesis_ms: u64,
+    abort_generation: u32,
 ) -> Result<(), String> {
     let wav_bytes = &speech.bytes;
+
+    // Re-check before writing anything: this path persists a file, a caption
+    // sidecar and a history row, all of which must not appear for a reading the
+    // user cancelled after the caller's check.
+    if !reading_may_publish(
+        abort_generation,
+        crate::ABORT_GENERATION.load(Ordering::SeqCst),
+    ) {
+        log::info!("[TTS] Reading replaced; skipping file output");
+        return Ok(());
+    }
+
     let output_dir = std::path::Path::new(&output_config.directory);
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("Failed to create output directory: {e}"))?;
@@ -897,6 +1351,18 @@ fn handle_file_output(
     } else {
         wav_bytes.to_vec()
     };
+
+    // `convert_audio_format` shells out (FFmpeg) for non-WAV formats, which is
+    // slow enough for a Stop to land mid-way. Re-check before the *persistent*
+    // work below — the destination file, its caption sidecar and the history
+    // row must not appear for a reading the user cancelled during conversion.
+    if !reading_may_publish(
+        abort_generation,
+        crate::ABORT_GENERATION.load(Ordering::SeqCst),
+    ) {
+        log::info!("[TTS] Reading replaced during format conversion; not writing output");
+        return Ok(());
+    }
 
     let output_path = output_dir.join(&filename);
     std::fs::write(&output_path, &audio_bytes)
@@ -935,6 +1401,7 @@ fn handle_file_output(
 }
 
 /// Handle normal playback output
+#[allow(clippy::too_many_arguments)]
 fn handle_playback_output(
     app: &AppHandle,
     config: &State<'_, Mutex<AppConfig>>,
@@ -948,9 +1415,21 @@ fn handle_playback_output(
     synthesis_ms: u64,
     already_streamed: bool,
     voice_label: Option<&str>,
+    abort_generation: u32,
 ) -> Result<(), String> {
     let wav_bytes = &speech.bytes;
     let envelope = extract_envelope_or_default(wav_bytes);
+
+    // Re-check before the persistent work below. The caller checked too, but a
+    // Stop can land in between; committing then would leave a history row, a
+    // saved file and a Replay cache entry for a reading the user cancelled.
+    if !reading_may_publish(
+        abort_generation,
+        crate::ABORT_GENERATION.load(Ordering::SeqCst),
+    ) {
+        log::info!("[TTS] Reading replaced; skipping output commit");
+        return Ok(());
+    }
 
     let engine_id = engine_identifier(active_backend);
     let voice_name = voice_display_name(active_backend, tts_config, voice, voice_label);
@@ -974,13 +1453,11 @@ fn handle_playback_output(
     // Cache audio for replay
     cache_audio(app, speech, text);
 
-    // Show HUD with waveform visualization
-    hud::show_hud(app, envelope, Some(text.to_string()));
-
     // Emit audio to frontend for browser-native playback. Skipped when PCM
     // chunks were already forwarded by the streaming synthesis path.
     if !already_streamed {
-        emit_audio_ready(app, speech, text);
+        hud::show_hud(app, envelope, Some(text.to_string()));
+        emit_audio_ready(app, speech, text, abort_generation);
     }
 
     Ok(())
@@ -1000,10 +1477,47 @@ pub async fn speak_queued(
     telemetry_state: State<'_, Mutex<telemetry::TelemetryLog>>,
     text: Option<String>,
 ) -> Result<(), String> {
+    speak_queued_with_owner(app, config, _player, history, queue, telemetry_state, text, None).await
+}
+
+pub async fn speak_queued_with_owner(
+    app: AppHandle,
+    config: State<'_, Mutex<AppConfig>>,
+    _player: State<'_, Mutex<AudioPlayer>>,
+    history: State<'_, Mutex<HistoryLog>>,
+    queue: State<'_, Mutex<FragmentQueue>>,
+    telemetry_state: State<'_, Mutex<telemetry::TelemetryLog>>,
+    text: Option<String>,
+    browser_reading_id: Option<String>,
+) -> Result<(), String> {
     let text = get_text_or_clipboard(text)?;
     if text.trim().is_empty() {
         return Err("Nothing to speak".into());
     }
+
+    // Honour `on_retrigger` before waiting on the shared synthesis lock. A
+    // running reading holds that lock for its whole duration, so aborting from
+    // inside it could only wait for the old reading to finish — which is the
+    // "queue after current" behaviour this setting exists to override.
+    // `do_abort_synthesis` only touches `std::sync` primitives, so calling it
+    // here cannot deadlock against the tokio lock, and it emits `playback-stop`,
+    // which is what actually silences the webview audio.
+    let interrupt = {
+        let cfg = config.lock().unwrap();
+        retrigger_interrupts(&cfg.playback.on_retrigger)
+    };
+    // A replacement adopts the generation its own abort produced. Using the
+    // value from this call's increment (rather than re-reading the atomic) is
+    // what stops a second retrigger racing alongside from being mistaken for
+    // our own abort and silently swallowing the reading the user just made.
+    let abort_generation = if interrupt {
+        crate::do_abort_synthesis(&app)
+    } else {
+        crate::ABORT_GENERATION.load(Ordering::SeqCst)
+    };
+
+    let lock_state = app.state::<tokio::sync::Mutex<()>>();
+    let _queue_lock = lock_state.lock().await;
 
     let (active_backend, tts_config, pagination_config, post_process_config, streaming_enabled) = {
         let cfg = config.lock().unwrap();
@@ -1019,10 +1533,21 @@ pub async fn speak_queued(
     // Clear any previous abort request, the same way speak_now_internal does.
     // Both commands feed drain_chunk_stream, which now honours the flag, so a
     // stale `true` from an earlier abort would kill this run's first stream.
+    if abort_generation != crate::ABORT_GENERATION.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     crate::ABORT_REQUESTED.store(false, Ordering::Relaxed);
+    if abort_generation != crate::ABORT_GENERATION.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let _synthesis_guard = SynthesisGuard::new(&app);
 
     // Optional LLM post-processing — best-effort; falls back on failure.
     let text = crate::post_process::try_process(text, &post_process_config).await;
+    if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let _ = app.emit("reading-started", &text);
 
     log_tts_debug("Queue", &format!("{:?}", active_backend), &text);
@@ -1066,10 +1591,13 @@ pub async fn speak_queued(
         0,
     );
 
-    // Clear previous queue and add new fragments
+    // Clear previous queue and add new fragments. `clear()` deliberately leaves
+    // the stop flag alone (the running loop may be watching it), so reset it
+    // here: a Stop/Abort earlier in the session must not silence this reading.
     {
         let q = queue.lock().unwrap();
         q.clear();
+        q.clear_stop_flag();
         q.add_fragments(fragments.clone());
     }
 
@@ -1082,9 +1610,6 @@ pub async fn speak_queued(
             is_paginated: fragments.len() > 1,
         },
     );
-
-    // Enter synthesis state
-    let _synthesis_guard = SynthesisGuard::new(&app);
 
     // Generate batch ID for grouping history entries
     let total = fragments.len();
@@ -1102,6 +1627,16 @@ pub async fn speak_queued(
     let engine_str_val = engine_str(&active_backend);
     let engine_id_val = engine_identifier(&active_backend);
 
+    // Pick the transport for the WHOLE reading, once. `supports_streaming` for a
+    // local CLI reflects whether its daemon is warm *right now*, so deciding per
+    // fragment let a reading start on the batch path (daemon still loading) and
+    // switch to streamed playback at a later fragment — the frontend then had
+    // batch audio playing while a PCM scheduler took over, and completion
+    // signals only ever reached one of them. Reusing one backend also keeps
+    // every fragment on the same engine options.
+    let reading_backend: Arc<Box<dyn TtsBackend>> =
+        Arc::new(create_backend_from_effective(&eff, &tts_config));
+
     // Repeated text replays saved audio — only when history holds every
     // fragment, so a reading never mixes saved and fresh parts nor leaves a
     // partial batch in history.
@@ -1115,53 +1650,86 @@ pub async fn speak_queued(
         log::info!("[Queue] Replaying saved audio for all {} fragments", total);
     }
 
+    // Decided only after `replaying`: a replayed reading has no synthesis to
+    // stream at all.
+    let stream_reading = !replaying
+        && allows_streaming_playback(
+            streaming_enabled,
+            reading_backend.supports_streaming(),
+            eff.effects.enabled,
+        );
+
     // Synthesize and play each fragment
+    // Fragments are collected as well as played so the whole reading can be
+    // cached for Replay (see the concat below).
+    let mut fragment_audio_for_cache: Vec<(SpeechAudio, String)> = Vec::new();
     for (index, fragment) in fragments.iter().enumerate() {
         // Check if we should stop
         {
             let q = queue.lock().unwrap();
-            if q.should_stop() {
-                log::info!("[Queue] Playback stopped by user");
+            if q.should_stop() || crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
+                // Clear the queue either way; only the *event* depends on whether
+                // this reading is still the current one. A replaced reading's
+                // `pagination:stopped` would reach the replacement's still-empty
+                // queue and mark it complete before it played anything.
                 q.clear();
-                let _ = app.emit(
-                    "pagination:stopped",
-                    PaginationEvent {
-                        total,
-                        current_index: index,
-                        is_paginated: total > 1,
-                    },
-                );
+                if reading_may_publish(
+                    abort_generation,
+                    crate::ABORT_GENERATION.load(Ordering::SeqCst),
+                ) {
+                    log::info!("[Queue] Playback stopped by user");
+                    let _ = app.emit(
+                        "pagination:stopped",
+                        PaginationEvent {
+                            total,
+                            current_index: index,
+                            is_paginated: total > 1,
+                        },
+                    );
+                } else {
+                    log::info!("[Queue] Reading replaced; exiting quietly");
+                }
                 return Ok(());
             }
         }
 
         log::debug!("[Queue] Synthesizing fragment {} of {}", index + 1, total);
 
+        // These UI/progress events are gated on the reading still being current.
+        // A fragment that finishes after a replacement has started must not
+        // overwrite the new reading's fragment index or progress in the HUD.
+        let still_current =
+            reading_may_publish(abort_generation, crate::ABORT_GENERATION.load(Ordering::SeqCst));
+
         // Emit fragment started event
-        let _ = app.emit(
-            "pagination:fragment-started",
-            PaginationEvent {
-                total,
-                current_index: index,
-                is_paginated: total > 1,
-            },
-        );
+        if still_current {
+            let _ = app.emit(
+                "pagination:fragment-started",
+                PaginationEvent {
+                    total,
+                    current_index: index,
+                    is_paginated: total > 1,
+                },
+            );
+        }
 
         // Emit progress update
-        let elapsed = synthesis_start.elapsed().as_millis() as u64;
-        let processed_chars: usize = fragments.iter().take(index).map(|f| f.text.len()).sum();
-        hud::emit_synthesis_progress(
-            &app,
-            total_estimate,
-            elapsed,
-            index,
-            total,
-            true,
-            avg_confidence,
-            truncate_preview(&fragment.text, 50),
-            total_chars,
-            processed_chars,
-        );
+        if still_current {
+            let elapsed = synthesis_start.elapsed().as_millis() as u64;
+            let processed_chars: usize = fragments.iter().take(index).map(|f| f.text.len()).sum();
+            hud::emit_synthesis_progress(
+                &app,
+                total_estimate,
+                elapsed,
+                index,
+                total,
+                true,
+                avg_confidence,
+                truncate_preview(&fragment.text, 50),
+                total_chars,
+                processed_chars,
+            );
+        }
 
         // Set current index in queue
         {
@@ -1169,23 +1737,15 @@ pub async fn speak_queued(
             q.set_current_index(index);
         }
 
-        // Create backend for this fragment from the resolved profile so engine
-        // options (model, format, etc.) are honored, not just the global config.
-        let backend: Box<dyn TtsBackend> = create_backend_from_effective(&eff, &tts_config);
-        let backend_arc = Arc::new(backend);
-
         // Synthesize fragment — streaming-capable backends forward PCM chunks
         // as they arrive; batch backends take the untouched synthesize path.
+        // `stream_reading` was fixed before the loop so this reading uses one
+        // transport throughout (see above).
+        let backend_arc = reading_backend.clone();
         let fragment_start = Instant::now();
-        let streamed = !replaying
-            && allows_streaming_playback(
-                streaming_enabled,
-                backend_arc.supports_streaming(),
-                eff.effects.enabled,
-            );
         let wav_bytes = if let Some(speech) = saved.as_mut().and_then(Iterator::next) {
-            speech
-        } else if streamed {
+            Ok(speech)
+        } else if stream_reading {
             synthesize_streaming_and_emit(
                 &app,
                 backend_arc.clone(),
@@ -1193,13 +1753,18 @@ pub async fn speak_queued(
                 voice.clone(),
                 index,
                 index + 1 == total,
+                abort_generation,
+                browser_reading_id.as_deref(),
             )
-            .await?
+            .await
         } else {
-            synthesize_async(backend_arc.clone(), fragment.text.clone(), voice.clone()).await?
-        };
+            synthesize_async(backend_arc.clone(), fragment.text.clone(), voice.clone()).await
+        }.map_err(|error| report_section_failure(&app, index, total, abort_generation, error))?;
         let fragment_duration = fragment_start.elapsed();
         if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
+            // Aborted mid-fragment — the path almost every retrigger takes, since
+            // a fragment in flight only notices the abort once it returns. Its
+            // guard emits the matching `synthesis-state-change: false`.
             return Ok(());
         }
 
@@ -1219,6 +1784,8 @@ pub async fn speak_queued(
             q.set_audio(index, wav_bytes.bytes.clone());
         }
 
+        fragment_audio_for_cache.push((wav_bytes.clone(), fragment.text.clone()));
+
         log::debug!(
             "[Queue] Synthesized fragment {} ({} bytes)",
             index + 1,
@@ -1229,12 +1796,17 @@ pub async fn speak_queued(
         let envelope = extract_envelope_or_default(&wav_bytes.bytes);
 
         // Transition HUD from synthesizing → playing on first fragment
-        if index == 0 {
+        if index == 0 && !stream_reading {
             hud::show_hud(&app, envelope.clone(), Some(text.clone()));
         }
 
-        // Save to history (a replay is already there)
-        if !replaying {
+        // Save to history (a replay is already there). Guarded on the reading
+        // still being current: an in-flight fragment finishes synthesizing even
+        // after a retrigger set the flag, and its file, caption sidecar and
+        // history row must not be written for a reading the user cancelled.
+        if !replaying
+            && reading_may_publish(abort_generation, crate::ABORT_GENERATION.load(Ordering::SeqCst))
+        {
             let audio_ext = backend_arc.file_extension().to_string();
             let voice_name = voice_display_name(
                 &active_backend,
@@ -1273,27 +1845,45 @@ pub async fn speak_queued(
 
         // Emit audio fragment for streaming playback. Skipped when the PCM
         // chunks were already forwarded by the streaming path above.
-        if !streamed {
-            emit_audio_fragment(&app, &wav_bytes, index, total, fragment.text.clone());
+        // (`emit_audio_fragment` re-checks the generation itself.)
+        if !stream_reading {
+            emit_audio_fragment(&app, &wav_bytes, index, total, fragment.text.clone(), abort_generation, browser_reading_id.as_deref());
         }
 
-        // Emit fragment events
-        let _ = app.emit(
-            "pagination:fragment-ready",
-            PaginationEvent {
-                total,
-                current_index: index,
-                is_paginated: total > 1,
-            },
-        );
-        let _ = app.emit(
-            "pagination:fragment-complete",
-            PaginationEvent {
-                total,
-                current_index: index,
-                is_paginated: total > 1,
-            },
-        );
+        // Emit fragment events. Gated like the started/progress events above so
+        // a replaced reading cannot overwrite the replacement's fragment state.
+        if reading_may_publish(abort_generation, crate::ABORT_GENERATION.load(Ordering::SeqCst)) {
+            let _ = app.emit(
+                "pagination:fragment-ready",
+                PaginationEvent {
+                    total,
+                    current_index: index,
+                    is_paginated: total > 1,
+                },
+            );
+            let _ = app.emit(
+                "pagination:fragment-complete",
+                PaginationEvent {
+                    total,
+                    current_index: index,
+                    is_paginated: total > 1,
+                },
+            );
+        }
+    }
+
+    // Every fragment synthesized. A reading that is no longer current must not
+    // publish anything: its cached audio is a reading the user cancelled, and
+    // its completion event would tell the frontend the *replacement* had ended,
+    // finishing the replacement's still-empty queue before it played a note.
+    // The generation differs here when this reading was replaced (a replacer
+    // always waits on the shared lock, so it cannot be mid-flight) or when the
+    // user stopped it in this tail window — both mean "do not publish".
+    if !reading_may_publish(
+        abort_generation,
+        crate::ABORT_GENERATION.load(Ordering::SeqCst),
+    ) {
+        return Ok(());
     }
 
     // Clear queue (frontend handles streaming)
@@ -1304,15 +1894,41 @@ pub async fn speak_queued(
 
     log::info!("[Queue] All {} fragments synthesized and streamed", total);
 
-    // Emit pagination complete event
-    let _ = app.emit(
-        "pagination:complete",
-        PaginationEvent {
-            total,
-            current_index: total - 1,
-            is_paginated: total > 1,
-        },
-    );
+    // Cache the whole reading so Replay works. speak_queued streams per fragment
+    // and the frontend never holds the full audio, so without this a Replay would
+    // fall back to a stale speak_now cache or the last fragment's buffer.
+    // `concat_speech` decodes every sample, so a retrigger can land during it;
+    // re-check the generation before committing anything. A cancelled reading
+    // must neither overwrite the cache with audio the user never finished nor
+    // wipe a valid previous cache on a concat failure.
+    let cached_reading = if fragment_audio_for_cache.is_empty() {
+        None
+    } else {
+        Some(crate::tts::captions::concat_speech(fragment_audio_for_cache))
+    };
+
+    if reading_may_publish(
+        abort_generation,
+        crate::ABORT_GENERATION.load(Ordering::SeqCst),
+    ) {
+        match cached_reading {
+            Some(Ok(speech)) => cache_audio(&app, &speech, &text),
+            Some(Err(e)) => {
+                *app.state::<Mutex<CachedAudio>>().lock().unwrap() = CachedAudio::default();
+                log::warn!("[Queue] Cannot cache full reading for replay: {e}");
+            }
+            None => {}
+        }
+
+        let _ = app.emit(
+            "pagination:complete",
+            PaginationEvent {
+                total,
+                current_index: total - 1,
+                is_paginated: total > 1,
+            },
+        );
+    }
 
     Ok(())
 }
@@ -1329,13 +1945,8 @@ pub async fn speak_history_entry(
     telemetry_state: State<'_, Mutex<telemetry::TelemetryLog>>,
     entry_id: String,
 ) -> Result<(), String> {
-    crate::ABORT_REQUESTED.store(false, Ordering::Relaxed);
-    let _synthesis_guard = SynthesisGuard::new(&app);
-    if crate::logging::is_debug_mode() {
-        log::debug!("[IPC] speak_history_entry called (id: {})", entry_id);
-    }
-
-    // Get text and voice from history
+    // Look the entry up *before* any abort: an unknown or deleted id must not
+    // stop whatever the user is currently hearing only to return "not found".
     let (text, original_voice) = {
         let hist = history.lock().unwrap();
         let entry = hist
@@ -1343,9 +1954,42 @@ pub async fn speak_history_entry(
             .ok_or_else(|| format!("History entry not found: {}", entry_id))?;
         (entry.text.clone(), entry.voice.clone())
     };
-
     if text.trim().is_empty() {
         return Err("Nothing to speak".to_string());
+    }
+
+    // Join the shared cancellation protocol used by speak_now/speak_queued.
+    // This command used to clear `ABORT_REQUESTED` unconditionally and skip the
+    // reading lock, so a history re-speak during a retrigger could wipe the
+    // abort flag the replaced reading was about to observe (letting it run on
+    // and emit into the replacement) or outlive the replacement and emit a
+    // stale `synthesis-state-change: false`.
+    let interrupt = {
+        let cfg = config.lock().unwrap();
+        retrigger_interrupts(&cfg.playback.on_retrigger)
+    };
+    let abort_generation = if interrupt {
+        crate::do_abort_synthesis(&app)
+    } else {
+        crate::ABORT_GENERATION.load(Ordering::SeqCst)
+    };
+
+    let lock_state = app.state::<tokio::sync::Mutex<()>>();
+    let _queue_lock = lock_state.lock().await;
+
+    if abort_generation != crate::ABORT_GENERATION.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    // Safe to clear now: this reading holds the lock and is still current, so
+    // no live reading is watching the flag.
+    crate::ABORT_REQUESTED.store(false, Ordering::Relaxed);
+    if abort_generation != crate::ABORT_GENERATION.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let _synthesis_guard = SynthesisGuard::new(&app);
+    if crate::logging::is_debug_mode() {
+        log::debug!("[IPC] speak_history_entry called (id: {})", entry_id);
     }
 
     let tts_config = {
@@ -1391,6 +2035,16 @@ pub async fn speak_history_entry(
     if crate::ABORT_REQUESTED.load(Ordering::Relaxed) {
         return Ok(());
     }
+    // A retrigger can land in the instant after the flag check above. This
+    // reading is no longer current then, so publishing would cache cancelled
+    // audio and emit it over the reading the user just started.
+    if !reading_may_publish(
+        abort_generation,
+        crate::ABORT_GENERATION.load(Ordering::SeqCst),
+    ) {
+        log::info!("[TTS] History reading replaced; nothing to play or save");
+        return Ok(());
+    }
     let synthesis_ms = synthesis_start.elapsed().as_millis() as u64;
 
     // Record telemetry
@@ -1426,7 +2080,7 @@ pub async fn speak_history_entry(
     hud::show_hud(&app, envelope, Some(text.clone()));
 
     // Emit audio to frontend
-    emit_audio_ready(&app, &wav_bytes, &text);
+    emit_audio_ready(&app, &wav_bytes, &text, abort_generation);
 
     log::info!("Re-spoke history entry: {}", entry_id);
     Ok(())
@@ -1664,5 +2318,70 @@ mod cache_tests {
         std::fs::remove_file(&second).unwrap();
         assert!(find_cached_reading(&history, text, &pagination, "edge", "ava").is_none());
         std::fs::remove_file(&first).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod retrigger_tests {
+    use super::*;
+
+    #[test]
+    fn only_interrupt_mode_aborts_the_running_reading() {
+        assert!(retrigger_interrupts(&config::RetriggerMode::Interrupt));
+        assert!(!retrigger_interrupts(&config::RetriggerMode::Queue));
+    }
+
+    #[test]
+    fn an_unreplaced_reading_publishes_its_result() {
+        assert!(reading_may_publish(7, 7));
+    }
+
+    /// The regression this fixes: a retrigger bumps the generation, so the
+    /// replaced reading must go quiet instead of caching its cancelled audio
+    /// and telling the frontend the replacement had already finished.
+    #[test]
+    fn a_replaced_reading_does_not_publish() {
+        let replaced = 7u32;
+        let replacement = replaced.wrapping_add(1);
+        assert!(!reading_may_publish(replaced, replacement));
+    }
+
+    /// A user Stop also advances the generation, so a reading stopped in the
+    /// tail window (after its last fragment, during the cache concat) must not
+    /// publish either. This is the second, post-concat gate.
+    #[test]
+    fn a_stopped_reading_does_not_publish_after_the_concat() {
+        let stopped_reading = 11u32;
+        assert!(!reading_may_publish(stopped_reading, stopped_reading + 1));
+    }
+
+    /// The emitters gate on the *generation*, not the flag: a replacement clears
+    /// `ABORT_REQUESTED` as it starts, so a flag check would let a replaced
+    /// reading's in-flight fragment through into the new reading.
+    #[test]
+    fn emit_gate_rejects_a_replaced_reading_even_after_the_flag_is_cleared() {
+        let replaced = 5u32;
+        let replacement = 6u32;
+        // `ABORT_REQUESTED` would already be false here (the replacement cleared
+        // it); only the generation still distinguishes the two readings.
+        assert!(!reading_may_publish(replaced, replacement));
+        assert!(reading_may_publish(replacement, replacement));
+    }
+
+    /// The per-fragment history/file write in `speak_queued` uses this same
+    /// predicate, so a fragment that finished synthesizing after the reading was
+    /// replaced must not leave a history row or caption sidecar behind.
+    #[test]
+    fn a_replaced_reading_does_not_persist_its_finished_fragments() {
+        let replaced = 42u32;
+        assert!(!reading_may_publish(replaced, replaced.wrapping_add(1)));
+        assert!(reading_may_publish(replaced, replaced));
+    }
+
+    #[test]
+    fn a_generation_wrap_still_separates_two_readings() {
+        // `do_abort_synthesis` wraps with `wrapping_add`, so the successor of
+        // u32::MAX is 0 and must still read as a different reading.
+        assert!(!reading_may_publish(u32::MAX, 0));
     }
 }

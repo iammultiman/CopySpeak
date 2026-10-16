@@ -1,6 +1,6 @@
 {
   "app": {
-    "title": "CopySpeak",
+    "title": "X-CopySpeak",
     "tagline": "AI text-to-speech for your clipboard"
   },
   "nav": {
@@ -112,8 +112,7 @@
       "pitch": "Pitch",
       "pitchDescription": "Pitch shift (0.5x - 2x)",
       "stopAndRestart": "Stop and restart",
-      "queueAfterCurrent": "Queue after current",
-      "ignoreNewTrigger": "Ignore new trigger"
+      "queueAfterCurrent": "Queue after current"
     },
     "triggers": {
       "title": "Trigger Settings",
@@ -225,15 +224,15 @@
     },
     "about": {
       "version": "Version",
-      "versionDescription": "Current CopySpeak version",
+      "versionDescription": "Current X-CopySpeak version",
       "sourceCode": "Source Code",
-      "sourceCodeDescription": "View CopySpeak on GitHub",
+      "sourceCodeDescription": "View X-CopySpeak on GitHub",
       "github": "GitHub",
       "acknowledgments": "Acknowledgments",
       "openai": {
         "title": "OpenAI TTS",
         "description": "High-quality neural text-to-speech",
-        "detail": "CopySpeak uses OpenAI's text-to-speech API for high-quality voice synthesis."
+        "detail": "X-CopySpeak uses OpenAI's text-to-speech API for high-quality voice synthesis."
       },
       "elevenlabs": {
         "title": "ElevenLabs",
@@ -569,7 +568,7 @@
     "success": {
       "engineSaved": "Engine saved successfully",
       "settingsSaved": "Settings saved",
-      "welcome": "Welcome to CopySpeak!",
+      "welcome": "Welcome to X-CopySpeak!",
       "configSaved": "Configuration saved! Let's get started.",
       "hudTest": "HUD test triggered",
       "historyCleanup": "History cleanup completed",
@@ -597,7 +596,7 @@
   },
   "onboarding": {
     "welcome": {
-      "title": "Welcome to CopySpeak",
+      "title": "Welcome to X-CopySpeak",
       "subtitle": "Configure your text-to-speech engine to get started, or skip and set it up later."
     },
     "engineConfig": "Engine Configuration",
@@ -625,7 +624,7 @@
   },
   "landing": {
     "hero": {
-      "title": "CopySpeak",
+      "title": "X-CopySpeak",
       "subtitle": "Modern AI TTS Orchestrator",
       "description": "A lightweight Windows app that reads clipboard text aloud using AI text-to-speech engines.",
       "download": "Download for Windows",
@@ -661,7 +660,7 @@
     },
     "screenshots": {
       "title": "Screenshots",
-      "subtitle": "See CopySpeak in action",
+      "subtitle": "See X-CopySpeak in action",
       "caption": "CopySpeak v0.1.8 — Main interface with Play tab"
     },
     "footer": {

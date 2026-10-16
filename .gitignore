@@ -28,6 +28,13 @@ DO_NOT_TOUCH/
 .claude/.headroom_wrap_marker.json
 .firecrawl
 /.scratch
+/artifacts/
+/.venv/
+/venv/
+/errors/
+/.vscode/*.local.*
+/.claude/settings.local.json
+/browser-native-host/*.local.json
 /.pi-subagents
 /.hermes
 /.reasonix

@@ -10,12 +10,13 @@ GREEN (fixed):  host forwards both frames, relays the accepted frame to stdout,
                 exits cleanly once stdin closes.
 """
 import json
+from pathlib import Path
 import struct
 import subprocess
 import sys
 import time
 
-HOST = r"D:\Projects\CopySpeak\browser-native-host\target\debug\copyspeak-browser-host.exe"
+HOST = str(Path(__file__).resolve().parents[1] / "target" / "debug" / "copyspeak-browser-host.exe")
 TEXT = "Hello harness world, this is the native host deadlock test passage."
 
 

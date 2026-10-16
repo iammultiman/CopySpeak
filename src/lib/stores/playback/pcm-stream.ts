@@ -10,6 +10,7 @@ import { TimeStretcher, type PcmChannel } from "./time-stretch";
 
 /** Payload of one `audio-stream-chunk` event (matches AudioStreamChunkEvent). */
 export interface StreamChunkPayload {
+  browser_reading_id?: string | null;
   /** Base64-encoded raw PCM data (empty on the terminal end-of-stream event) */
   audio_base64: string;
   sample_rate: number;
@@ -29,6 +30,7 @@ export interface StreamChunkPayload {
 
 /** One decoded chunk of native-rate PCM, still unstretched. */
 interface PendingChunk {
+  browserReadingId?: string | null;
   channels: PcmChannel[];
   /** Native seconds of audio this chunk carries. */
   duration: number;
@@ -37,6 +39,7 @@ interface PendingChunk {
 }
 
 interface ScheduledPosition {
+  browserReadingId?: string | null;
   fragmentIndex: number;
   /** Native seconds into the fragment where this source's audio begins. */
   offset: number;
@@ -141,6 +144,7 @@ export class PcmStreamScheduler {
   private _stretcherChannels = 0;
   /** Fragment the scheduler is currently emitting audio for. */
   private _scheduleFragment: number | null = null;
+  private _scheduleBrowserReadingId: string | null = null;
   /** Native seconds of that fragment already scheduled. */
   private _emittedNative = 0;
 
@@ -166,6 +170,12 @@ export class PcmStreamScheduler {
   /** True while this scheduler owns audible state (buffers or live sources). */
   isActive(): boolean {
     return this._activeSources.size > 0 || this._pending.length > 0;
+  }
+
+  beginReading(): void {
+    this._clearIdleTimer();
+    this._finished = false;
+    this._completed = false;
   }
 
   /** Update output volume (0-100, same scale as the playback store). */
@@ -219,7 +229,11 @@ export class PcmStreamScheduler {
    * latency (20-40 ms wired, 150-250 ms Bluetooth). AudioContext time freezes
    * on pause; no progress is reported in an underrun.
    */
-  getPlaybackPosition(): { fragmentIndex: number; positionMs: number } | null {
+  getPlaybackPosition(): {
+    fragmentIndex: number;
+    positionMs: number;
+    browserReadingId?: string | null;
+  } | null {
     const audible = this._ctx.currentTime - Math.max(0, this._ctx.outputLatency || 0);
     this._endedPositions = this._endedPositions.filter(
       (position) => position.start + position.duration / position.rate > audible
@@ -228,6 +242,7 @@ export class PcmStreamScheduler {
       const played = (audible - position.start) * position.rate;
       if (played >= 0 && played < position.duration) {
         return {
+          browserReadingId: position.browserReadingId,
           fragmentIndex: position.fragmentIndex,
           positionMs: (position.offset + played) * 1000
         };
@@ -291,6 +306,7 @@ export class PcmStreamScheduler {
 
     const duration = channelData[0].length / payload.sample_rate;
     this._pending.push({
+      browserReadingId: payload.browser_reading_id ?? null,
       channels: channelData,
       duration,
       sampleRate: payload.sample_rate,
@@ -339,8 +355,10 @@ export class PcmStreamScheduler {
    * Completion fires once all scheduled sources have drained.
    */
   markQueueComplete(): void {
+    if (this._finished) return;
     this._clearIdleTimer();
     this._finished = true;
+    this.handleFragmentEnd();
     if (!this.isActive()) {
       this._complete();
     }
@@ -384,6 +402,7 @@ export class PcmStreamScheduler {
     this._pausedByUser = false;
     this._stretcher = null;
     this._scheduleFragment = null;
+    this._scheduleBrowserReadingId = null;
     this._emittedNative = 0;
     try {
       this._gain.disconnect();
@@ -436,11 +455,16 @@ export class PcmStreamScheduler {
     while (this._pending.length > 0) {
       const chunk = this._pending.shift()!;
       this._pendingDuration -= chunk.duration;
-      if (this._scheduleFragment !== null && this._scheduleFragment !== chunk.fragmentIndex) {
+      if (
+        this._scheduleFragment !== null &&
+        (this._scheduleFragment !== chunk.fragmentIndex ||
+          this._scheduleBrowserReadingId !== (chunk.browserReadingId ?? null))
+      ) {
         this._flushStretcher();
       }
       const stretcher = this._ensureStretcher(chunk);
       this._scheduleFragment = chunk.fragmentIndex;
+      this._scheduleBrowserReadingId = chunk.browserReadingId ?? null;
       this._scheduleOutput(stretcher.push(chunk.channels), chunk.sampleRate, chunk);
     }
   }
@@ -470,6 +494,7 @@ export class PcmStreamScheduler {
     source.start(at);
     const nativeDuration = buffer.duration * this._speed;
     this._activeSources.set(source, {
+      browserReadingId: this._scheduleBrowserReadingId,
       fragmentIndex: this._scheduleFragment ?? 0,
       offset: this._emittedNative,
       duration: nativeDuration,

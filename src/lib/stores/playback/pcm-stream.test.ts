@@ -21,6 +21,12 @@ function createHarness() {
   const ctx = {
     currentTime: 0,
     state: "running",
+    resume: async () => {
+      ctx.state = "running";
+    },
+    suspend: async () => {
+      ctx.state = "suspended";
+    },
     destination: {},
     createGain: () => ({
       gain: { value: 1 },
@@ -96,6 +102,85 @@ afterEach(() => {
 });
 
 describe("PcmStreamScheduler", () => {
+  it("keeps reading ownership on audible PCM across identical fragment indices", () => {
+    const { scheduler, ctx } = createHarness();
+    scheduler.handleChunk(chunk(new Uint8Array(48000)));
+    scheduler.handleChunk({ ...chunk(new Uint8Array(48000)), browser_reading_id: "browser" });
+    ctx.currentTime = 0.53;
+    expect(scheduler.getPlaybackPosition()).toMatchObject({
+      fragmentIndex: 0,
+      browserReadingId: null
+    });
+    ctx.currentTime = 1.53;
+    expect(scheduler.getPlaybackPosition()).toMatchObject({
+      fragmentIndex: 0,
+      browserReadingId: "browser"
+    });
+    scheduler.stop();
+  });
+  it("drains a second failed reading while the completed first reading is still audible", () => {
+    const { scheduler, sources, onComplete } = createHarness();
+    scheduler.setRate(1.5, 1);
+    scheduler.handleChunk(chunk(new Uint8Array(48000)));
+    scheduler.markQueueComplete();
+    expect(onComplete).not.toHaveBeenCalled();
+    scheduler.beginReading();
+    scheduler.handleChunk(chunk(new Uint8Array(4800)));
+    const beforeFlush = sources.length;
+    scheduler.markQueueComplete();
+    expect(sources.length).toBeGreaterThan(beforeFlush);
+    for (const source of sources) source.onended?.();
+    expect(onComplete).toHaveBeenCalledOnce();
+    scheduler.stop();
+  });
+
+  it("does not emit a second stretched tail after the terminal marker", () => {
+    const { scheduler, sources, onComplete } = createHarness();
+    scheduler.setRate(1.5, 1);
+    scheduler.handleChunk(chunk(new Uint8Array(48000)));
+    scheduler.handleChunk(chunk(new Uint8Array(), 1, true));
+    const sourceCount = sources.length;
+    scheduler.markQueueComplete();
+    expect(sources).toHaveLength(sourceCount);
+    for (const source of sources) source.onended?.();
+    expect(onComplete).toHaveBeenCalledOnce();
+    scheduler.stop();
+  });
+
+  it.each([1, 1.5])("drains a failed sub-prebuffer stream once at speed %s", (speed) => {
+    const { scheduler, sources, ctx, onComplete } = createHarness();
+    scheduler.setRate(speed, 1);
+    scheduler.handleChunk(chunk(pcmBytes(Array.from({ length: 2400 }, () => 8192))));
+    expect(sources).toHaveLength(0);
+    ctx.state = "suspended";
+    scheduler.pause();
+    scheduler.markQueueComplete();
+    expect(ctx.state).toBe("suspended");
+    expect(sources.length).toBeGreaterThan(0);
+    expect(onComplete).not.toHaveBeenCalled();
+    const sourceCount = sources.length;
+    scheduler.markQueueComplete();
+    expect(sources).toHaveLength(sourceCount);
+    for (const source of sources) source.onended?.();
+    expect(onComplete).toHaveBeenCalledOnce();
+    expect(scheduler.isActive()).toBe(false);
+    scheduler.stop();
+  });
+
+  it("flushes the stretched tail of a failed stream that already started", () => {
+    const { scheduler, sources, onComplete } = createHarness();
+    scheduler.setRate(1.5, 1);
+    scheduler.handleChunk(chunk(new Uint8Array(48000)));
+    expect(sources.length).toBeGreaterThan(0);
+    const beforeFlush = sources.length;
+    scheduler.markQueueComplete();
+    expect(sources.length).toBeGreaterThan(beforeFlush);
+    expect(onComplete).not.toHaveBeenCalled();
+    for (const source of sources) source.onended?.();
+    expect(onComplete).toHaveBeenCalledOnce();
+    scheduler.stop();
+  });
+
   it("reports the audible fragment and freezes its clock through pause and underruns", () => {
     const { scheduler, sources, ctx } = createHarness();
     const second = new Uint8Array(48000);

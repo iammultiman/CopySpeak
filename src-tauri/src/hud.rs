@@ -273,32 +273,12 @@ pub fn show_hud(app: &AppHandle, envelope: AmplitudeEnvelope, text: Option<Strin
         log::warn!("HUD window not found");
     }
 
-    // Spawn a thread so we don't block the caller (possibly on Tokio runtime).
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        log::info!("Emitting hud:start event to hud window");
-        log::debug!(
-            "[HUD] Event payload: envelope values={}, text={:?}",
-            envelope.values.len(),
-            text
-        );
-
-        if let Err(e) = app_clone.emit(
-            "hud:start",
-            HudStartPayload {
-                envelope,
-                text,
-                provider,
-                voice,
-            },
-        ) {
-            log::error!("Failed to emit hud:start event: {}", e);
-        } else {
-            log::info!("hud:start emitted");
-        }
-    });
+    if let Err(error) = app.emit(
+        "hud:start",
+        HudStartPayload { envelope, text, provider, voice },
+    ) {
+        log::error!("Failed to emit hud:start event: {error}");
+    }
 }
 
 pub fn show_hud_synthesizing(app: &AppHandle, text: Option<String>) {
@@ -327,25 +307,12 @@ pub fn show_hud_synthesizing(app: &AppHandle, text: Option<String>) {
         log::warn!("HUD window not found");
     }
 
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        log::info!("Emitting hud:synthesizing event (global)");
-        if let Err(e) = app_clone.emit(
-            "hud:synthesizing",
-            HudSynthesizingPayload {
-                text,
-                provider,
-                voice,
-                duration_ms: None,
-            },
-        ) {
-            log::error!("Failed to emit hud:synthesizing event: {}", e);
-        } else {
-            log::info!("hud:synthesizing emitted");
-        }
-    });
+    if let Err(error) = app.emit(
+        "hud:synthesizing",
+        HudSynthesizingPayload { text, provider, voice, duration_ms: None },
+    ) {
+        log::error!("Failed to emit hud:synthesizing event: {error}");
+    }
 }
 
 /// Show HUD for playback of existing audio file.

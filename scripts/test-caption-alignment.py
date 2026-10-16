@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -82,6 +83,52 @@ class AlignmentTests(unittest.TestCase):
         self.assertEqual(wire.read(len(pcm)), pcm)
         self.assertEqual(json.loads(wire.readline()), {"end": True})
         self.assertEqual(wire.read(), b"")
+
+    def test_kokoro_daemon_flushes_before_requesting_next_chunk(self):
+        output = SimpleNamespace(buffer=io.BytesIO())
+        pcm = b"\x01\x00\x02\x00"
+        snapshots = [{"text": "Hi there", "words": []},
+                     {"text": "Hi there", "words": [{"text_start": 3, "text_end": 8,
+                      "start_ms": 25, "end_ms": 50}]}]
+
+        def stream(*args):
+            yield pcm, 24000, 1, snapshots[0]
+            if args[2] != "Ready.":
+                self.assertTrue(output.buffer.getvalue().endswith(pcm))
+            yield pcm, 24000, 1, snapshots[1]
+
+        with patch.object(kokoro, "stream", stream), patch.object(kokoro.sys, "stdout", output), \
+                patch.object(kokoro.sys, "stdin", io.StringIO('{"text":"Hi there"}\n')):
+            self.assertEqual(kokoro.serve(None, "af_heart", None), 0)
+        wire = io.BytesIO(output.buffer.getvalue())
+        self.assertEqual(wire.readline(), b"READY 2\n")
+        self.assertEqual(json.loads(wire.readline())["bits_per_sample"], 16)
+        for captions in snapshots:
+            self.assertEqual(json.loads(wire.readline()), {"captions": captions})
+            self.assertEqual(json.loads(wire.readline()), {"chunk": len(pcm)})
+            self.assertEqual(wire.read(len(pcm)), pcm)
+        self.assertEqual(json.loads(wire.readline()), {"end": True})
+        self.assertEqual(wire.read(), b"")
+
+    def test_kokoro_one_shot_keeps_all_chunks_and_final_captions(self):
+        session = SimpleNamespace(get_outputs=lambda: [SimpleNamespace(name="waveform"),
+                                  SimpleNamespace(name="duration")],
+                                  get_providers=lambda: ["CPUExecutionProvider"])
+        modules = {"kokoro_onnx": SimpleNamespace(Kokoro=lambda *args: SimpleNamespace(sess=session)),
+                   "misaki": SimpleNamespace(en=SimpleNamespace(G2P=lambda **kwargs: None),
+                   espeak=SimpleNamespace(EspeakFallback=lambda **kwargs: None))}
+        captions = {"text": "Hi there", "words": []}
+        chunks = [(b"\x01\x00", 24000, 1, None), (b"\x02\x00", 24000, 1, captions)]
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "speech.wav")
+            with patch.dict(kokoro.sys.modules, modules), \
+                    patch.object(kokoro.sys, "argv", ["kokoro", "--text", "Hi there", "--output", output]), \
+                    patch.object(kokoro, "resolve_models", return_value=("model", "voices")), \
+                    patch.object(kokoro, "stream", return_value=iter(chunks)), \
+                    patch.object(kokoro, "write_wav") as write:
+                self.assertEqual(kokoro.main(), 0)
+            write.assert_called_once_with(output, b"\x01\x00\x02\x00", 24000, 1)
+            self.assertEqual(json.loads(Path(output + ".captions.json").read_text()), captions)
 
     def test_native_sample_counts_preserve_silence_and_sentence_offsets(self):
         alignment = [SimpleNamespace(phoneme=p, num_samples=n) for p, n in

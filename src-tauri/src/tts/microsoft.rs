@@ -102,7 +102,7 @@ impl TtsBackend for MicrosoftTtsBackend {
                 start_time.elapsed(),
                 e
             );
-            TtsError::Http(format!("Request failed: {}", e))
+            TtsError::Http(format!("Request failed: {}", super::error_chain(&e)))
         })?;
 
         let status = response.status();
@@ -121,7 +121,7 @@ impl TtsBackend for MicrosoftTtsBackend {
         );
 
         let bytes = Self::block_on_async(async { response.bytes().await })
-            .map_err(|e| TtsError::Http(format!("Failed to read bytes: {}", e)))?;
+            .map_err(|e| TtsError::Http(format!("Failed to read bytes: {}", super::error_chain(&e))))?;
 
         if !status.is_success() {
             let error_text = String::from_utf8_lossy(&bytes);

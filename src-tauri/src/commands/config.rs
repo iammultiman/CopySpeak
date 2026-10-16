@@ -295,6 +295,13 @@ pub fn set_config(
     // Emit config-changed event so frontend can react
     let _ = app.emit("config-changed", ());
 
+    // Warm the active engine in the background so a voice, device, or profile
+    // change does not leave the first reading paying the cold model load. The
+    // daemon registry no-ops when the same configuration is already warm, so
+    // this is cheap for the common settings-only save.
+    let tts_for_prewarm = config.lock().unwrap().tts.clone();
+    std::thread::spawn(move || crate::commands::prewarm_active_profile(&tts_for_prewarm));
+
     Ok(())
 }
 

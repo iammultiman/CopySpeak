@@ -117,17 +117,12 @@ $profileJson = @"
   "schema_version": 1,
   "id": "kitten-local",
   "name": "Kitten TTS (Local)",
-  "engine": "local",
+  "engine": "kitten",
   "voice": "$chosenVoice",
   "speed": 1.0,
   "pitch": 1.0,
   "effects": { "enabled": false, "active_effect": "none" },
-  "engine_options": {
-    "engine": "local",
-    "preset": "kitten-tts",
-    "command": "uv",
-    "args_template": ["run", "--project", "{engine_dir}/kitten", "python", "{engine_dir}/kitten/scripts/copyspeak-kitten.py", "--text-file", "{input}", "--voice", "{voice}", "--output", "{output}", "--model", "{model}", "--speed", "{speed}"]
-  }
+  "engine_options": { "engine": "kitten", "cuda": false }
 }
 "@
 

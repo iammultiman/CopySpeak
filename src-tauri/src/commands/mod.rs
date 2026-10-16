@@ -44,6 +44,7 @@ pub struct PaginationEvent {
 /// Event emitted when a fragment's audio is ready for streaming playback.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AudioFragmentEvent {
+    pub browser_reading_id: Option<String>,
     /// Base64-encoded WAV audio data
     pub audio_base64: String,
     /// Zero-based index of this fragment
@@ -60,6 +61,7 @@ pub struct AudioFragmentEvent {
 /// Event carrying one PCM chunk of streaming synthesis audio.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AudioStreamChunkEvent {
+    pub browser_reading_id: Option<String>,
     /// Base64-encoded raw PCM data (empty on the terminal end-of-stream event)
     pub audio_base64: String,
     pub sample_rate: u32,

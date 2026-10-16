@@ -1,10 +1,40 @@
-# CopySpeak
+# X-CopySpeak
 
-**Current Version:** 0.2.8
+**Current Version:** 0.2.14
 
-A modern desktop app that reads clipboard text aloud using AI Text-to-Speech engines. Trigger speech by quickly copying the same text twice in a row — works out of the box with no API key (Edge TTS is the default engine).
+A desktop app that reads clipboard text aloud using AI text-to-speech engines.
+Trigger speech by quickly copying the same text twice in a row. Fresh installs
+recommend Kokoro for offline speech; Edge TTS is a no-download alternative whose
+availability depends on Microsoft's service. Existing engine selections are preserved.
 
-## [Download Latest](https://github.com/ilyaizen/CopySpeak/releases)
+## About This Fork
+
+**X-CopySpeak** is the independently maintained fork of
+[CopySpeak by ilyaizen](https://github.com/ilyaizen/CopySpeak). The fork's repository
+is [iammultiman/X-CopySpeak](https://github.com/iammultiman/X-CopySpeak).
+Upstream authorship and the MIT license are retained.
+
+Work since the fork focuses on Windows playback, pagination, cancellation,
+retrigger behavior, engine startup, and browser-reading ownership. See
+[the fork improvements and issue ledger](docs/issues-and-fixes.md) for the
+complete recorded changes and limitations, [user-confirmed results](successes.md)
+for tested outcomes, and [the changelog](CHANGELOG.md) for version history.
+Features already present in the baseline are not claimed as fork additions.
+
+## Windows Test Build
+
+X-CopySpeak retains CopySpeak's application identifier, executable basename,
+settings directories, engine scripts, and browser protocol for compatibility.
+It replaces the existing installation rather than running alongside it. Back up
+your settings before testing an installer against an existing installation.
+
+The **Build X-CopySpeak Windows Test Installer** GitHub Actions workflow uploads
+an artifact containing `copyspeak.exe` and `X-CopySpeak_<version>_x64-setup.exe`.
+Download the artifact from the completed Actions run and run the setup executable.
+The test build is unsigned, does not publish a release, and disables automatic
+updates to the upstream CopySpeak release. Windows may display a SmartScreen warning.
+
+## [Build Downloads](https://github.com/iammultiman/X-CopySpeak/actions)
 
 ![CopySpeak screenshot](static/screen-0.2.6.png)
 
@@ -12,18 +42,27 @@ A modern desktop app that reads clipboard text aloud using AI Text-to-Speech eng
 
 ### Windows
 
-1. Download `CopySpeak_<version>_x64-setup.exe` and run it (`.msi` also available).
+1. Open a successful **Build X-CopySpeak Windows Test Installer** run under
+   [Actions](https://github.com/iammultiman/X-CopySpeak/actions/workflows/build-windows-test.yml).
+   Download its artifact ZIP, extract it, and run `bundle/nsis/X-CopySpeak_<version>_x64-setup.exe`.
+   GitHub sign-in is required to download Actions artifacts; artifacts expire.
 2. On first launch, onboarding walks you through picking an engine and voice.
-3. Updates: the app checks GitHub Releases automatically (or via **Check for updates** in the footer).
+3. Install later fork builds manually. Windows test installers disable automatic
+   updates. A signed fork update channel has not been configured; the base
+   development/release configuration still contains the upstream updater URL
+   and key, so do not treat its update checker as an X-CopySpeak update source.
 
 ### Linux (x86_64)
 
-Tested on Omarchy (Arch, Wayland); ships AppImage, `.deb`, and `.rpm`:
+Linux support is inherited from upstream, including AppImage, `.deb`, and `.rpm`
+packaging. The Windows fork fixes have not been user-validated on Linux. No new
+Linux release is published by this documentation update. When a fork package is
+available, use its actual filename; for example:
 
 ```bash
 # AppImage
-chmod +x CopySpeak_<version>_amd64.AppImage
-./CopySpeak_<version>_amd64.AppImage
+chmod +x X-CopySpeak_<version>_amd64.AppImage
+./X-CopySpeak_<version>_amd64.AppImage
 
 # Debian / Ubuntu
 sudo apt install ./copyspeak_<version>_amd64.deb
@@ -37,7 +76,10 @@ On Wayland compositors the HUD runs through XWayland and global hotkeys are prot
 ### Browser companion (Chrome / Edge)
 
 1. Install and start the desktop app first — the extension drives it.
-2. Download `CopySpeak-Companion-<version>.zip` from the same release and extract it.
+2. Obtain the companion separately; the Windows test artifact contains only the
+   desktop executable and installer. The inherited release workflows can package
+   `CopySpeak-Companion-<version>.zip`, or build it using the
+   [browser companion setup guide](BROWSER_EXTENSION.md).
 3. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select the extracted `dist` folder.
 4. Open the extension's settings to grant per-site access, then select text and double-copy (or use the extension's toolbar button) to read it through the app.
 
@@ -55,7 +97,7 @@ bun run tauri dev
 - **Multiple trigger modes**: Double-copy (1.5s window), hotkey, or manual paste/play
 - **13 TTS engines**:
   - **Local** — Piper, Kokoro, Kitten, Qwen3-TTS (multilingual, 9 CustomVoice voices), Pocket, or any CLI TTS tool via local subprocess
-  - **Edge TTS** — Free Microsoft Edge Read Aloud backend (default)
+  - **Edge TTS** — Free Microsoft Edge Read Aloud backend (service-dependent alternative)
   - **OpenAI TTS** — Cloud API with 9 voices
   - **ElevenLabs TTS** — Cloud API with voice library support
   - **Cartesia TTS** — Sonic 3.5 cloud API
@@ -84,7 +126,8 @@ bun run tauri dev
 
 - **System tray** — Quick access controls
 - **Browser companion** — Chrome/Edge extension to read your selection or hovered paragraphs through the app, with a context menu, status badge, and per-site permissions
-- **Auto-updater** — Check and install updates from GitHub Releases
+- **Update support** — Inherited GitHub Releases updater; disabled in Windows
+  test installers. A signed X-CopySpeak update channel is not yet configured.
 - **Control server** — Local HTTP server for external integrations (Pi, Claude Code, curl)
 - **Pi & Claude Code extensions** — Speak AI assistant responses through CopySpeak
 - **Audio save mode** — Save TTS output to files

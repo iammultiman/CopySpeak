@@ -150,7 +150,7 @@
     isSaving = true;
     try {
       await invoke("complete_onboarding", { engine: engineId });
-      toast.success("Welcome to CopySpeak!");
+      toast.success("Welcome to X-CopySpeak!");
       await goto("/");
     } catch (e) {
       console.error("Failed to complete onboarding:", e);

@@ -50,12 +50,69 @@ impl GoogleTtsBackend {
             .unwrap_or(GEMINI_PCM_SAMPLE_RATE)
     }
 
+    /// Whether this model expects read-aloud stage directions inline in the
+    /// transcript.
+    ///
+    /// The 2.5 and 3.1 preview TTS models are prompt-steered: they were built
+    /// to be told what to do in plain text. Gemini 3.8 TTS treats the text part
+    /// strictly as a verbatim transcript and moves delivery onto
+    /// `speechMetadata`, so prefixing it would make the model speak the
+    /// instruction out loud (the documented migration note).
+    fn expects_inline_direction(model: &str) -> bool {
+        model.starts_with("gemini-2.") || model.starts_with("gemini-3.1-flash-tts")
+    }
+
+    /// Anchor every request to "read this, do not answer it".
+    ///
+    /// Without it a clipboard snippet that reads like a question, a command, or
+    /// code makes the model generate a text answer, which the TTS-only gateway
+    /// rejects with HTTP 400 "Model tried to generate text, but it should only
+    /// be used for TTS". A system instruction is a separate text channel, so it
+    /// does not pollute the transcript on models that speak it verbatim.
+    fn read_aloud_system_instruction() -> serde_json::Value {
+        json!({
+            "parts": [{
+                "text": "You are a text-to-speech engine. Read the user's transcript \
+                         aloud verbatim. Never answer it, translate it, summarize it, \
+                         or add commentary. Produce audio only."
+            }]
+        })
+    }
+
+    /// The text part for one request: the transcript, prefixed with a read-aloud
+    /// instruction only for the legacy models that are steered that way.
+    fn payload_text(model: &str, text: &str) -> String {
+        if Self::expects_inline_direction(model) {
+            format!(
+                "Read the following text aloud exactly as written. \
+                 Do not answer it, translate it, or add anything:\n\n{text}"
+            )
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn audio_to_wav(audio: Vec<u8>, mime: &str) -> Vec<u8> {
+        if audio.starts_with(b"RIFF") && audio.get(8..12) == Some(b"WAVE".as_slice()) {
+            audio
+        } else {
+            pcm16_to_wav(&audio, Self::rate_from_mime(mime), 1)
+        }
+    }
+
     /// Pull the base64 audio out of one `streamGenerateContent` SSE payload.
     /// Returns `None` for events that carry no audio part (Gemini interleaves
     /// metadata-only events), which are skipped rather than treated as errors.
     fn audio_from_sse_event(payload: &str) -> Option<(Vec<u8>, u32)> {
         let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
-        let part = parsed.pointer("/candidates/0/content/parts/0/inlineData")?;
+        // Scan the parts rather than assuming `parts[0]`: a candidate may carry
+        // a text part (a refusal, or reasoning) before the audio part, and
+        // hardcoding index 0 silently dropped those events' audio.
+        let part = parsed
+            .pointer("/candidates/0/content/parts")?
+            .as_array()?
+            .iter()
+            .find_map(|part| part.get("inlineData"))?;
         let data_b64 = part.get("data")?.as_str()?;
         let mime = part.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
         let pcm = general_purpose::STANDARD.decode(data_b64).ok()?;
@@ -128,7 +185,8 @@ impl TtsBackend for GoogleTtsBackend {
             GEMINI_BASE, self.config.model
         );
         let body = json!({
-            "contents": [{ "parts": [{ "text": text }] }],
+            "systemInstruction": Self::read_aloud_system_instruction(),
+            "contents": [{ "parts": [{ "text": Self::payload_text(&self.config.model, text) }] }],
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": {
@@ -156,7 +214,12 @@ impl TtsBackend for GoogleTtsBackend {
                         .json(&body)
                         .send()
                         .await
-                        .map_err(|e| TtsError::Http(format!("Google stream request failed: {e}")))?;
+                        .map_err(|e| {
+                            TtsError::Http(format!(
+                                "Google stream request failed: {}",
+                                super::error_chain(&e)
+                            ))
+                        })?;
                     let status = response.status();
                     if !status.is_success() {
                         let error_text = response.text().await.unwrap_or_default();
@@ -166,11 +229,12 @@ impl TtsBackend for GoogleTtsBackend {
                     }
 
                     let mut buffer = String::new();
-                    while let Some(chunk) = response
-                        .chunk()
-                        .await
-                        .map_err(|e| TtsError::Http(format!("Google stream read failed: {e}")))?
-                    {
+                    while let Some(chunk) = response.chunk().await.map_err(|e| {
+                        TtsError::Http(format!(
+                            "Google stream read failed: {}",
+                            super::error_chain(&e)
+                        ))
+                    })? {
                         buffer.push_str(&String::from_utf8_lossy(&chunk));
                         for payload in Self::drain_sse_payloads(&mut buffer) {
                             let Some((pcm, rate)) = Self::audio_from_sse_event(&payload) else {
@@ -210,7 +274,8 @@ impl TtsBackend for GoogleTtsBackend {
     fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>, TtsError> {
         let url = format!("{}/{}:generateContent", GEMINI_BASE, self.config.model);
         let body = json!({
-            "contents": [{ "parts": [{ "text": text }] }],
+            "systemInstruction": Self::read_aloud_system_instruction(),
+            "contents": [{ "parts": [{ "text": Self::payload_text(&self.config.model, text) }] }],
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
                 "speechConfig": {
@@ -248,7 +313,7 @@ impl TtsBackend for GoogleTtsBackend {
                 start_time.elapsed(),
                 e
             );
-            TtsError::Http(format!("Request failed: {}", e))
+            TtsError::Http(format!("Request failed: {}", super::error_chain(&e)))
         })?;
 
         let status = response.status();
@@ -273,7 +338,9 @@ impl TtsBackend for GoogleTtsBackend {
             .map_err(|e| TtsError::Http(format!("Invalid JSON response: {}", e)))?;
 
         let part = parsed
-            .pointer("/candidates/0/content/parts/0/inlineData")
+            .pointer("/candidates/0/content/parts")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|parts| parts.iter().find_map(|part| part.get("inlineData")))
             .ok_or_else(|| TtsError::Http("No audio in Google response".into()))?;
 
         let data_b64 = part
@@ -282,11 +349,15 @@ impl TtsBackend for GoogleTtsBackend {
             .ok_or_else(|| TtsError::Http("Missing inlineData.data".into()))?;
         let mime = part.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
 
-        let pcm = general_purpose::STANDARD
+        let audio = general_purpose::STANDARD
             .decode(data_b64)
             .map_err(|e| TtsError::Http(format!("Base64 decode failed: {}", e)))?;
 
-        let wav = pcm16_to_wav(&pcm, Self::rate_from_mime(mime), 1);
+        // Gemini 2.5/3.1 TTS answer a unary request with headerless raw PCM
+        // (audio/L16). Gemini 3.8 TTS answers with a complete RIFF/WAVE file.
+        // Wrapping a WAV again would double the header and make the file read
+        // as garbage, so sniff the container and pass an existing one through.
+        let wav = Self::audio_to_wav(audio, mime);
         log::info!("Google TTS synthesis complete: {} WAV bytes", wav.len());
         Ok(wav)
     }
@@ -309,6 +380,41 @@ impl TtsBackend for GoogleTtsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modern_tts_transcripts_do_not_include_instructions() {
+        let text = "What is the capital of Peru?";
+        for model in ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"] {
+            assert_eq!(GoogleTtsBackend::payload_text(model, text), text);
+        }
+        for model in ["gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-preview"] {
+            let prompt = GoogleTtsBackend::payload_text(model, text);
+            assert!(prompt.starts_with("Read the following text aloud"));
+            assert!(prompt.ends_with(text));
+        }
+    }
+
+    #[test]
+    fn complete_wav_is_not_wrapped_twice() {
+        let pcm = vec![1, 2, 3, 4];
+        let wav = pcm16_to_wav(&pcm, 24000, 1);
+        assert_eq!(GoogleTtsBackend::audio_to_wav(wav.clone(), "audio/wav"), wav);
+        assert_eq!(GoogleTtsBackend::audio_to_wav(pcm, "audio/L16;rate=24000"), wav);
+    }
+
+    #[test]
+    fn streamed_audio_can_follow_metadata() {
+        let event = json!({
+            "candidates": [{"content": {"parts": [
+                {"text": "metadata"},
+                {"inlineData": {"mimeType": "audio/l16;rate=24000", "data": "AQIDBA=="}}
+            ]}}]
+        });
+        assert_eq!(
+            GoogleTtsBackend::audio_from_sse_event(&event.to_string()),
+            Some((vec![1, 2, 3, 4], 24000))
+        );
+    }
 
     #[test]
     fn test_pcm16_to_wav_header() {

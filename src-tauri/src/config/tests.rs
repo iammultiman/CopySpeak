@@ -3,6 +3,27 @@ mod tests {
     use crate::config::*;
 
     #[test]
+    fn retrigger_defaults_to_queue_and_round_trips_both_modes() {
+        assert_eq!(
+            AppConfig::default().playback.on_retrigger,
+            RetriggerMode::Queue,
+            "an interrupted reading must be opt-in"
+        );
+        for (wire, expected) in [
+            ("interrupt", RetriggerMode::Interrupt),
+            ("queue", RetriggerMode::Queue),
+        ] {
+            let raw = format!(r#"{{"on_retrigger":"{wire}"}}"#);
+            let parsed: PlaybackConfig = serde_json::from_str(&raw).unwrap();
+            assert_eq!(parsed.on_retrigger, expected);
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap()["on_retrigger"],
+                serde_json::json!(wire)
+            );
+        }
+    }
+
+    #[test]
     fn streaming_setting_defaults_on_and_persists_when_disabled() {
         let mut config = serde_json::to_value(AppConfig::default()).unwrap();
         assert_eq!(config["playback"]["streaming_enabled"], true);
@@ -274,7 +295,7 @@ mod tests {
     fn test_default_tts_config_uses_kokoro_profile() {
         let tts = TtsConfig::default();
         assert_eq!(TtsEngine::default(), TtsEngine::Kokoro);
-        assert_eq!(tts.schema_version, 6);
+        assert_eq!(tts.schema_version, 7);
         assert_eq!(tts.active_backend, TtsEngine::Kokoro);
         assert_eq!(tts.profiles.len(), 7);
         // The legacy Edge "default" profile stays (zero-download fallback).
@@ -316,6 +337,166 @@ mod tests {
         crate::config::tts::migrate_add_kokoro_profile_v6(&mut tts);
         assert_eq!(tts.profiles.len(), before + 1);
         assert_eq!(tts.schema_version, 6);
+    }
+
+    /// A legacy Piper `Local` preset exactly as `install-piper.ps1` used to
+    /// write it, including the CWD-relative wrapper path that produced
+    /// "voice model not found ... Available: []".
+    fn legacy_piper_profile() -> VoiceProfile {
+        VoiceProfile {
+            id: "piper-local".into(),
+            name: "Piper (Local)".into(),
+            description: None,
+            engine: TtsEngine::Local,
+            voice: "en_US-amy-medium".into(),
+            voice_label: None,
+            speed: 1.0,
+            pitch: 1.0,
+            effects: ProfileEffects {
+                enabled: false,
+                active_effect: crate::config::EffectId::None,
+            },
+            text_processing: ProfileTextProcessing::default(),
+            engine_options: ProfileEngineOptions::Local(LocalEngineOptions {
+                command: Some("uv".into()),
+                args_template: Some(vec![
+                    "run".into(),
+                    "--project".into(),
+                    "{engine_dir}/piper".into(),
+                    "python".into(),
+                    "scripts/copyspeak-piper.py".into(),
+                    "--text-file".into(),
+                    "{input}".into(),
+                    "--voice".into(),
+                    "{voice}".into(),
+                    "--output".into(),
+                    "{output}".into(),
+                ]),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_migrate_tts_profiles_v7_promotes_piper_and_migrates_gemini() {
+        let mut tts = TtsConfig::default();
+        tts.schema_version = 6;
+        tts.google.model = "gemini-2.5-flash-preview-tts".into();
+        tts.profiles.push(legacy_piper_profile());
+        // Make the legacy Piper profile active so the schema mirror matters.
+        tts.active_profile_id = "piper-local".into();
+        tts.active_backend = TtsEngine::Local;
+
+        crate::config::tts::migrate_tts_profiles_v7(&mut tts);
+
+        assert_eq!(tts.schema_version, 7);
+        let piper = tts
+            .profiles
+            .iter()
+            .find(|p| p.id == "piper-local")
+            .expect("legacy Piper profile must survive promotion");
+        // Promoted to the first-class engine, so it gets the daemon + GPU toggle.
+        assert_eq!(piper.engine, TtsEngine::Piper);
+        assert!(matches!(
+            piper.engine_options,
+            ProfileEngineOptions::Piper(_)
+        ));
+        // The profile's own settings are kept.
+        assert_eq!(piper.voice, "en_US-amy-medium");
+        assert!(!piper.effects.enabled);
+        // ...and the derived mirror follows the promoted engine.
+        assert_eq!(tts.active_backend, TtsEngine::Piper);
+
+        // Gemini moves off the retired preview model, globally and per profile.
+        assert_eq!(tts.google.model, "gemini-3.8-flash-tts");
+        let gemini = tts
+            .profiles
+            .iter()
+            .find(|p| p.engine == TtsEngine::Google)
+            .expect("bundled Gemini profile");
+        match &gemini.engine_options {
+            ProfileEngineOptions::Google(o) => {
+                assert_eq!(o.model.as_deref(), Some("gemini-3.8-flash-tts"));
+            }
+            other => panic!("unexpected Gemini options: {other:?}"),
+        }
+
+        // Idempotent: a second run changes nothing.
+        let once = tts.clone();
+        crate::config::tts::migrate_tts_profiles_v7(&mut tts);
+        assert_eq!(tts.schema_version, 7);
+        assert_eq!(tts.profiles.len(), once.profiles.len());
+        assert_eq!(tts.active_backend, TtsEngine::Piper);
+    }
+
+    #[test]
+    fn test_migrate_tts_profiles_v7_leaves_custom_local_clis_alone() {
+        // A hand-written local CLI that merely mentions the Piper wrapper (a
+        // different command, or extra user flags) is not the installer's preset
+        // and must not be rewritten — promoting it would replace the user's
+        // command with the fixed template and discard their settings.
+        let mut tts = TtsConfig::default();
+        tts.schema_version = 6;
+        for (id, command, args) in [
+            (
+                "custom-python",
+                Some("C:/Python312/python.exe"),
+                vec!["C:/my/copyspeak-piper.py", "--device", "cuda"],
+            ),
+            (
+                "custom-flags",
+                Some("uv"),
+                vec!["run", "scripts/copyspeak-piper.py", "--my-flag", "1"],
+            ),
+        ] {
+            let mut profile = legacy_piper_profile();
+            profile.id = id.into();
+            profile.engine_options = ProfileEngineOptions::Local(LocalEngineOptions {
+                command: command.map(str::to_string),
+                args_template: Some(args.into_iter().map(str::to_string).collect()),
+            });
+            tts.profiles.push(profile);
+        }
+        tts.profiles.push(legacy_piper_profile());
+
+        crate::config::tts::migrate_tts_profiles_v7(&mut tts);
+
+        for id in ["custom-python", "custom-flags"] {
+            let profile = tts
+                .profiles
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("{id} must survive"));
+            assert_eq!(
+                profile.engine,
+                TtsEngine::Local,
+                "{id} must not be promoted to the first-class Piper engine"
+            );
+        }
+        // The real installer preset beside them is still promoted.
+        let installer = tts
+            .profiles
+            .iter()
+            .find(|p| p.id == "piper-local")
+            .expect("installer Piper profile");
+        assert_eq!(installer.engine, TtsEngine::Piper);
+    }
+
+    #[test]
+    fn test_bundled_kokoro_profile_disables_effects_for_streaming() {
+        // The bundled local engines ship with effects off (as their installers
+        // write), because an enabled effect forces the fragment path and makes
+        // the whole fragment synthesize before any audio plays.
+        let tts = TtsConfig::default();
+        let kokoro = tts
+            .profiles
+            .iter()
+            .find(|p| p.id == "profile-kokoro-default")
+            .expect("bundled Kokoro profile");
+        assert!(
+            !kokoro.effects.enabled,
+            "bundled Kokoro must not enable an effect, or it loses streaming playback"
+        );
+        assert_eq!(kokoro.effects.active_effect, crate::config::EffectId::None);
     }
 
     #[test]

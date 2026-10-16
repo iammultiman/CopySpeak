@@ -8,20 +8,28 @@ it("uses one button for play, stop, replay, and cancelling synthesis", async () 
   const onPlay = vi.fn();
   const onStop = vi.fn();
   const onAbort = vi.fn();
+  const onTogglePause = vi.fn();
   const view = render(PlaybackControls, {
     isPlaying: false,
+    isPaused: false,
     isSynthesizing: false,
     playMode: "play",
     onPlay,
     onStop,
-    onAbort
+    onAbort,
+    onTogglePause
   });
   await fireEvent.click(view.getByRole("button", { name: "Play" }));
   expect(onPlay).toHaveBeenCalledTimes(1);
   await view.rerender({ isPlaying: true });
-  expect(view.getAllByRole("button")).toHaveLength(1);
+  expect(view.getAllByRole("button")).toHaveLength(2);
   await fireEvent.click(view.getByRole("button", { name: "Stop" }));
   expect(onStop).toHaveBeenCalledTimes(1);
+  await fireEvent.click(view.getByRole("button", { name: "Pause" }));
+  expect(onTogglePause).toHaveBeenCalledTimes(1);
+  await view.rerender({ isPlaying: true, isPaused: true });
+  await fireEvent.click(view.getByRole("button", { name: "Resume" }));
+  expect(onTogglePause).toHaveBeenCalledTimes(2);
   await view.rerender({ isPlaying: false, playMode: "replay" });
   await fireEvent.click(view.getByRole("button", { name: "Replay" }));
   expect(onPlay).toHaveBeenCalledTimes(2);

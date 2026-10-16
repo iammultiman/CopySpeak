@@ -281,7 +281,7 @@ impl ElevenLabsTtsBackend {
                         );
                         let _ = tx.send(ChunkItem::Failed(format!(
                             "ElevenLabs stream request failed: {}",
-                            e
+                            super::error_chain(&e)
                         )));
                         return;
                     }
@@ -359,7 +359,8 @@ impl ElevenLabsTtsBackend {
                             );
                             let _ = tx.send(ChunkItem::Failed(format!(
                                 "ElevenLabs stream read failed after {} bytes: {}",
-                                total_bytes, e
+                                total_bytes,
+                                super::error_chain(&e)
                             )));
                             return;
                         }
@@ -833,7 +834,7 @@ impl TtsBackend for ElevenLabsTtsBackend {
         .map_err(|e| {
             let elapsed = start_time.elapsed();
             log::error!("ElevenLabs TTS request failed after {:?}: {}", elapsed, e);
-            TtsError::Http(format!("Request failed: {}", e))
+            TtsError::Http(format!("Request failed: {}", super::error_chain(&e)))
         })?;
 
         let elapsed = start_time.elapsed();
@@ -870,7 +871,7 @@ impl TtsBackend for ElevenLabsTtsBackend {
 
         let bytes = Self::block_on_async(async { response.bytes().await }).map_err(|e| {
             log::error!("Failed to read response bytes: {}", e);
-            TtsError::Http(format!("Failed to read bytes: {}", e))
+            TtsError::Http(format!("Failed to read bytes: {}", super::error_chain(&e)))
         })?;
 
         log::info!(

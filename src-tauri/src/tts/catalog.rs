@@ -944,8 +944,9 @@ pub fn list_engines() -> Vec<EngineCatalogEntry> {
                     "model",
                     "Model",
                     EngineOptionKind::Text,
-                    "Gemini TTS model.",
-                    serde_json::json!("gemini-2.5-flash-preview-tts"),
+                    "Gemini TTS model. Use gemini-3.8-flash-tts (recommended) or \
+                     gemini-3.8-flash-lite-tts for lower latency and cost.",
+                    serde_json::json!("gemini-3.8-flash-tts"),
                 ),
                 option(
                     "output_format",

@@ -16,6 +16,15 @@ pub fn abort_synthesis(app: tauri::AppHandle) -> Result<(), String> {
         log::debug!("[IPC] abort_synthesis called");
     }
     crate::do_abort_synthesis(&app);
+    // A user-initiated abort ends any browser companion session, even one that
+    // has not spoken yet. The frontend suppresses its own report for a silent
+    // reading (a retrigger must not close the reading that replaces it), so
+    // without this the companion bar would linger with nothing to say. A
+    // retrigger uses `do_abort_synthesis` directly, never this command.
+    crate::browser_bridge::end_active_browser_reading(
+        &app,
+        crate::browser_bridge::SessionStatus::Cancelled,
+    );
     Ok(())
 }
 
@@ -43,9 +52,12 @@ pub fn replay_cached(
 
     use base64::{engine::general_purpose, Engine as _};
     let encoded = general_purpose::STANDARD.encode(&wav_bytes);
-    if let Err(e) = app.emit(
+    // Propagate an emit failure so the frontend can fall back to its local
+    // buffer instead of treating a silently-undelivered replay as success.
+    app.emit(
         "audio-fragment-ready",
         super::AudioFragmentEvent {
+            browser_reading_id: None,
             audio_base64: encoded,
             fragment_index: 0,
             fragment_total: 1,
@@ -53,29 +65,33 @@ pub fn replay_cached(
             text,
             captions,
         },
-    ) {
-        log::warn!("Failed to emit audio-ready: {}", e);
-    }
-
-    Ok(())
+    )
+    .map_err(|e| {
+        log::warn!("Failed to emit replay audio: {e}");
+        format!("Failed to emit replay audio: {e}")
+    })
 }
 
 #[tauri::command]
 pub fn stop_speaking(
     app: tauri::AppHandle,
-    player: State<'_, Mutex<AudioPlayer>>,
+    _player: State<'_, Mutex<AudioPlayer>>,
 ) -> Result<(), String> {
     if crate::logging::is_debug_mode() {
         log::debug!("[IPC] stop_speaking called");
     }
-    // Emit event so frontend audio element stops
-    if let Err(e) = app.emit("playback-stop", ()) {
-        log::warn!("Failed to emit playback-stop: {}", e);
-    }
-    // Keep Rodio stop as safety net
-    let mut p = player.lock().unwrap();
-    p.stop();
-    p.set_playing_entry_id(None);
+    // Delegate to the shared abort path so a Stop behaves exactly like Abort:
+    // it kills any running CLI child process, sets ABORT_REQUESTED, stops and
+    // clears the fragment queue, resets tray/JOB state, and emits playback-stop.
+    // Hand-rolling a subset here used to leave synth running and the queue
+    // stop flag set, which silenced every later double-copy reading.
+    crate::do_abort_synthesis(&app);
+    // Same as abort_synthesis: a user Stop ends a browser reading that has not
+    // spoken yet, which the frontend deliberately does not report itself.
+    crate::browser_bridge::end_active_browser_reading(
+        &app,
+        crate::browser_bridge::SessionStatus::Cancelled,
+    );
     Ok(())
 }
 
@@ -87,13 +103,19 @@ pub fn toggle_pause(
     if crate::logging::is_debug_mode() {
         log::debug!("[IPC] toggle_pause called");
     }
-    // Emit event so frontend audio element toggles pause
+    // `playback-toggle-pause` is the single event that owns the pause toggle:
+    // the frontend store listens for it and flips the audible player. Callers
+    // must NOT also toggle the store themselves (the Play-page button used to,
+    // which made every click cancel itself out over the IPC round-trip).
     if let Err(e) = app.emit("playback-toggle-pause", ()) {
         log::warn!("Failed to emit playback-toggle-pause: {}", e);
     }
-    // Keep Rodio toggle as safety net
+    // Rodio is the fallback for saved-audio playback that does not run through
+    // the webview stream; only touch it when it is actually playing.
     let mut p = player.lock().unwrap();
-    p.toggle_pause();
+    if p.is_playing() {
+        p.toggle_pause();
+    }
     Ok(())
 }
 
@@ -232,6 +254,7 @@ pub fn play_history_entry(
     if let Err(e) = app.emit(
         "audio-fragment-ready",
         super::AudioFragmentEvent {
+            browser_reading_id: None,
             audio_base64: encoded,
             fragment_index: 0,
             fragment_total: 1,

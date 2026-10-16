@@ -37,8 +37,36 @@ Keep active failure log short: entries for work not in `## Active work` move to 
 
 ## Active failure log
 
+- Preserve `browser_reading_id` from queued synthesis through batch fragments and scheduled PCM positions; never infer browser ownership from active-session state, matching text, or fragment index when Queue After Current leaves desktop audio playing.
+- Report section synthesis failures globally before the synthesis guard releases playback; retry only transient failures, and never retry streamed PCM after any audio has been emitted or silently skip article text.
+
+- Re-check cancellation after a daemon startup wait and before one-shot fallback; batch collection must poll cancellation too, since effects disable streaming playback.
+
+- Give a local engine's bundled profile the same `effects` value its installer writes; `ProfileEffects::default()` is effects-enabled with walkie-talkie, and `allows_streaming_playback` requires `!effects_enabled`, so any bundled profile that uses the default silently loses the streaming fast path and pays whole-fragment synthesis before first audio.
+
+- Yield PCM per native inference window in a local wrapper instead of joining the fragment first, and make every consumer loop all chunks — the one-shot path takes `next(stream(...))`, which silently truncates once `stream` yields more than once.
+
+- Warm the active engine after `set_active_profile` and `set_config`, not only in the Tauri `setup` hook; otherwise the first reading after a profile or voice change pays the full cold model load.
+
+- Never resolve a wrapper's data directory from `__file__`; pass it explicitly (`--voices-dir`). A legacy profile launched the wrapper by a CWD-relative path, so `Path(__file__).resolve().parent.parent` became the app install dir and Piper reported "voice model not found ... Available: []".
+
+- Promote a legacy `Local` preset to its first-class engine variant when the engine gains one; only Pocket had a promotion, so Piper profiles kept running the generic CLI path with no daemon and a stale args_template.
+
+- Pin the header style for a container-sniffing TTS reply; Gemini 3.8 unary returns `audio/wav` while 2.5/3.1 returned headerless PCM, so wrapping unconditionally double-headers the file.
+
+- Frame a Gemini TTS request as read-aloud, and only inline for pre-3.8 models; `systemInstruction` covers all of them, but 3.8 treats the text part as a verbatim transcript and will speak an inline instruction out loud.
+
+- Treat an Edge-TTS 403 as a Microsoft-side block, not a local misconfiguration: 7.2.8 is the newest release, so no upgrade, cache refresh, or concurrency setting helps, and the app runs Edge through `uv run --with edge-tts==7.2.8` with an embedded wrapper, so nothing on `PATH` or in a project venv is upgradable. It is _not_ unfixable, though: `communicate.py` binds `WSS_URL` with `from .constants import ...`, so patch `edge_tts.communicate.WSS_URL` (not `edge_tts.constants`) in the wrapper to retarget Microsoft's current host — 7.2.2 shipped `api.msedgeservices.com/tts/cognitiveservices/websocket/v1` with `Ocp-Apim-Subscription-Key` and the same token value. Refusal is regional, so keep the legacy host as the first attempt and fall back only on a denied handshake.
+
 - Release the old browser reading before asking the document to capture its replacement; a later disconnect erases the new paragraph/selection anchor.
+- Key the browser session's eager failure finish off whether anything was audible (`active_fragment != NO_FRAGMENT`), not off `speak_queued` returning `Err`: `finish_session` is first-wins, so ending it at the first error marks the reading failed but also tears the companion bar and word highlights off the page while buffered fragments are still speaking.
+- Scan every retry signal in a synthesis error instead of returning on the first status token: edge-tts pairs `NoAudioReceived("No audio was received...")` with the refused handshake's `403`, and a first-token-wins classification read the `403`, called it permanent, and skipped the retry the phrase list existed to allow.
+- Flatten a reqwest error's `source()` chain into the message at every provider request site; reqwest's `Display` prints only the kind (`error sending request`), so a timeout or a dropped connection stringifies to a bare kind and the retry classifier cannot see the cause.
+- Judge the browser session's eager failure finish on delivered audio as well as audibility (`delivered` flag plus `active_fragment != NO_FRAGMENT`): a fragment can reach the frontend and fail before its first throttled progress report, and `finish_session` is first-wins, so finishing on audibility alone still tears the bar off under audio about to speak. Mark `delivered` in the existing `audio-fragment-ready`/`audio-stream-chunk` Rust listeners, never from a frontend IPC acknowledgement: Tauri runs Rust listeners synchronously inside `emit`, so that happens strictly before the failure is classified, whereas an acknowledgement can arrive after the irreversible decision.
 - Pass Kokoro exporter options by their long names through `Invoke-Uv`; PowerShell binds `-o` as an ambiguous common parameter before uv runs.
+- Carry the browser reading's id through start, progress, delivery and finish, and resolve every one by that id; `sessions.values().next()` picks an arbitrary session once a reconnect leaves a second one registered, so an old reading could be served by the new reading's reports. Retire superseded sessions on start rather than relying on there being only one.
+- Guard the browser reading's lifecycle EVENT HANDLERS, not its terminal reporter: a retrigger in Interrupt mode aborts the previous playback while the new reading is still silent, and `synthesis-state-change: false`, `playback-stop` and `synthesis-aborted` then complete the empty queue or call `handleStop`, which used to tear the new session down before its first fragment. Leave the report itself unconditional so an explicit Stop can still end a silent session.
+- End the browser session from the stop commands themselves (`stop_speaking`, `abort_synthesis`, the tray abort) via `end_active_browser_reading`; `do_abort_synthesis` is shared with the retrigger path, which must NOT close the reading that replaces it, so the distinction cannot live inside it. The frontend cannot tell a user Stop from retrigger teardown for a silent reading.
 - Export Kokoro's duration-capable model under isolated Python 3.12; Kokoro 0.8.4's NumPy 1.x dependency cannot use the managed engine's Python 3.13 wheels.
 - Check credential presence without printing `.env` values; never grep secret files into command output.
 - Round estimated caption milliseconds once, after accumulating sentence offsets; rounding per sentence and then offsetting re-rounds sentence-boundary pairs apart by 0.1 ms, and that `start_ms < audio_end` clears the whole reading's captions.
@@ -60,6 +88,16 @@ Keep active failure log short: entries for work not in `## Active work` move to 
 - Pass `uv init` its target directory positionally (`uv init --bare --name X <dir>`); uv 0.12+ hard-errors on `uv --project <dir> init`, which only shows up when creating a fresh engine project.
 - Allow `createWaveShaper` only as a directly called member; keep rejecting local declarations and every other symbol containing "shape".
 - Double-copy and browser readings run `speak_queued`; Play page, hotkey and control server run `speak_now`. Change both paths together (saved-audio replay, `reading-started`).
+- Route `pagination:complete`/`pagination:stopped` to whichever player owns playback (`_pcmScheduler` vs `_fragmentQueue`), never both: during PCM streaming the fragment queue is empty, so signalling it clears the scheduler mid-drain.
+- `FragmentQueue::clear()` leaves `stop_flag` set; every new `speak_queued` reading must call `clear_stop_flag()`, or the first Stop/Abort silences all later double-copy and browser readings until restart.
+- `FragmentQueue::markComplete()` only completes when the queue is drained and is a no-op otherwise; use it for stop/abort and as a `synthesis-state-change: false` safety net (a mid-reading synthesis failure emits neither `is_final` nor `pagination:stopped`, so a starved queue would otherwise hang).
+- Reset the queue's final-marker when the reading's first fragment (`index === 0`) is enqueued, not on a separate new-reading event: clearing mid-playback lets an in-flight fragment's `ended` handler drop the next reading's audio.
+- Own the pause toggle in exactly one place: the backend `toggle_pause` command emits `playback-toggle-pause` and the store applies it. A caller that also toggles the store cancels itself out over the IPC round-trip.
+- `speak_queued` never assembled or cached its audio, so `replay_cached` replayed a stale `speak_now` reading or the last fragment; concat the fragments and `cache_audio` the whole reading before `pagination:complete`.
+- `SetCurrentProcessExplicitAppUserModelID` is `unsafe` in windows-rs 0.58 and takes a `PCWSTR` (`Param<PCWSTR>` is not implemented for `&HSTRING` in windows-core 0.58); bind the `HSTRING` to a local and pass `PCWSTR(app_id.as_ptr())` inside `unsafe`.
+- Keep an unbreakable token whole up to `TOKEN_HARD_CAP` (4096) in `force_split_ranges`; the clause-delimiter fallback must include CJK punctuation (`，。！？、：；`), since CJK has no inter-word whitespace to snap to.
+- Treat a period as intra-token only when a word character follows it, or (trailing) when it closes an initialism (`U.S.A.`, `Ph.D.`); a trailing period after a normal word (`too.`) stays a sentence boundary.
+- `bun run test` fails in a bare Linux container with "Could not resolve 'node:module'" until `svelte-kit sync` has generated `.svelte-kit/tsconfig.json`; run it first (the `check` script does).
 - `hud:*` events fire only while the HUD is enabled; main-window UI reads `playbackStore.caption` and `reading-started`, never HUD events.
 - The browser pipe serves one client at a time; the native host retries `ERROR_PIPE_BUSY` with `WaitNamedPipeW` instead of failing the reading.
 - Start the browser session's state ticker at accept time, not after `speak_queued` returns; `speak_queued` awaits the entire synthesis loop, so a post-synthesis ticker pins the companion panel at `buffering` for the whole generation while audio already plays.

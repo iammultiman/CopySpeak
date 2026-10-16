@@ -20,6 +20,38 @@ use stream::ChunkStream;
 
 use thiserror::Error;
 
+/// A transport error's full reason chain as text.
+///
+/// reqwest's `Display` prints only the error *kind*: a timeout or a dropped
+/// connection becomes a bare `error sending request`, with the cause hidden in
+/// `source()`. Flattening the chain keeps the words the retry classifier matches
+/// on (`operation timed out`, `connection refused`, ...) in the message, instead
+/// of throwing them away at the point the error is stringified.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    // Bounded so a deep chain cannot allocate without limit, and a cyclic
+    // `source()` cannot loop forever. The dedup below only suppresses duplicate
+    // *output*; it does not stop traversal, so the depth cap is what guarantees
+    // termination.
+    const MAX_LINKS: usize = 16;
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    let mut traversed = 0usize;
+    while let Some(current) = source {
+        traversed += 1;
+        if traversed > MAX_LINKS {
+            break;
+        }
+        let text = current.to_string();
+        // Skip empty links and a source that repeats something already seen,
+        // which some wrapper errors do.
+        if !text.is_empty() && !parts.iter().any(|seen| seen == &text) {
+            parts.push(text);
+        }
+        source = current.source();
+    }
+    parts.join(": ")
+}
+
 #[derive(Error, Debug)]
 #[allow(dead_code)]
 pub enum TtsError {

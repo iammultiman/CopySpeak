@@ -1,4 +1,9 @@
-# Browser Extension
+# X-CopySpeak Browser Companion
+
+X-CopySpeak retains the existing **CopySpeak Companion** extension name and
+native-messaging identifiers for compatibility. This guide describes the
+companion used with the fork; protocol names and executable basenames are not
+personal machine identifiers.
 
 CopySpeak Companion is a Chromium extension for reading a text selection aloud
 without leaving the current page. It works with the running Windows desktop app
@@ -24,7 +29,7 @@ support are rejected.
 
 `browser-extension/` captures the selection and owns the page UI.
 `browser-native-host/` relays Chrome native-messaging frames to
-`\\.\pipe\copyspeak-browser`. The desktop bridge starts a normal CopySpeak
+`\\.\pipe\copyspeak-browser`. The desktop bridge starts an X-CopySpeak
 reading and projects audible caption timings back to the original selection.
 
 Word highlighting degrades per word and per fragment, never per reading. The
@@ -38,14 +43,17 @@ current-word marker, while the fragments around it still follow the word.
 
 This is currently a developer preview, not a packaged extension.
 
-1. Build the native host from `browser-native-host/` and update
-   `browser-native-host/com.copyspeak.browser.json` with its absolute `.exe`
-   path.
+1. Build the native host from `browser-native-host/`. On Windows, the tracked
+   `com.copyspeak.browser.json` uses a path relative to its directory. For a
+   different layout, create an ignored `com.copyspeak.browser.local.json` with
+   your executable path and register that local file instead. Do not commit
+   machine-specific paths. Linux manifests require absolute paths and should
+   be generated locally by the platform installer.
 2. Register that manifest for the matching unpacked Chrome extension ID.
 3. Run `bun run build` in `browser-extension/`, then load
    `browser-extension/dist/` as an unpacked extension in Chrome or Edge.
-4. Start CopySpeak, select ordinary page text, then use the action or shortcut.
+4. Start X-CopySpeak, select ordinary page text, then use the action or shortcut.
 
-The manifest currently embeds a development executable path and a single
-extension origin. A release needs an installer that writes the browser registry
+The tracked manifest supplies a relative development executable path and a single
+public extension origin. A release needs an installer that writes the browser registry
 entry, ships the host binary, and binds the production extension ID.

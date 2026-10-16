@@ -343,6 +343,21 @@ impl CliTtsBackend {
             args = kept;
         }
 
+        // Piper resolves its voice models from <engine_dir>/voices/, not next
+        // to its wrapper. That works because the first-class Piper template
+        // points at an absolute `{engine_dir}/piper/scripts/copyspeak-piper.py`,
+        // so `Path(__file__)` lands inside the engine dir. The legacy bug was a
+        // *CWD-relative* template ("scripts/copyspeak-piper.py") run from the
+        // app install dir, which made the wrapper look for voices there and
+        // report "voice model not found ... Available: []"; the v7 migration
+        // promotes those profiles onto the absolute template.
+        //
+        // The wrapper also accepts `--voices-dir`, but it is deliberately NOT
+        // injected here: installed wrappers are copies made at install time, so
+        // an older copy would abort with "unrecognized arguments" and take the
+        // whole engine offline. Passing the flag is left to callers who know
+        // their wrapper supports it.
+
         // Our own wrappers understand --device; third-party CLIs do not, so the
         // flag is only added for engines we ship a wrapper for. When cuda is off
         // the arg list is byte-identical to before, which keeps existing daemon
@@ -471,10 +486,22 @@ impl TtsBackend for CliTtsBackend {
         text: &str,
         voice: &str,
     ) -> Result<super::captions::SpeechAudio, TtsError> {
+        // A Stop or retrigger during start-up (a cold model load, or the daemon
+        // handshake) must not be answered by running the expensive one-shot
+        // command — that would spawn a second model copy for a reading the user
+        // has already replaced, on top of the load the next reading is paying.
+        // `synthesize_streaming_and_emit` discards empty bytes when aborted.
+        if crate::ABORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!("[CLI TTS] Synthesis cancelled before start; skipping one-shot");
+            return Ok(Vec::new().into());
+        }
+
         // A resident daemon keeps the voice model in RAM; fall through to the
         // one-shot command only when it can't serve this request.
         if let Some(stream) = self.daemon_stream(text, voice) {
-            match super::stream::collect_speech(stream) {
+            match super::stream::collect_speech_cancellable(stream, || {
+                crate::ABORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+            }) {
                 Ok(speech) => {
                     log::info!(
                         "[CLI TTS] Synthesized via daemon — {} bytes",
@@ -484,6 +511,10 @@ impl TtsBackend for CliTtsBackend {
                 }
                 Err(e) => log::warn!("[CLI TTS] Daemon stream failed ({e}); using one-shot"),
             }
+        }
+
+        if crate::ABORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(Vec::new().into());
         }
 
         let input_path = Self::input_path();
@@ -521,12 +552,25 @@ impl TtsBackend for CliTtsBackend {
             cmd.creation_flags(CREATE_NO_WINDOW);
             cmd.env("PATH", get_expanded_path());
         }
-        let child = cmd
+        if crate::ABORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&input_path);
+            return Ok(Vec::new().into());
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| TtsError::Unavailable(format!("{}: {e}", self.command)))?;
 
         // Store PID so abort_synthesis can kill this process
         crate::ACTIVE_CLI_PID.store(child.id(), std::sync::atomic::Ordering::Relaxed);
+
+        if crate::ABORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::kill_process_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            crate::ACTIVE_CLI_PID.store(0, std::sync::atomic::Ordering::Relaxed);
+            let _ = std::fs::remove_file(&input_path);
+            return Ok(Vec::new().into());
+        }
 
         let result = child
             .wait_with_output()
@@ -802,10 +846,20 @@ impl TtsBackend for CliTtsBackend {
             })?;
         }
 
-        // For Piper, check if voice files exist
+        // For Piper, check if voice files exist. First-class Piper installs keep
+        // their voices in <engine_dir>/piper/voices (where the installer puts
+        // them) and resolve them from there, so check that location first;
+        // ~/piper-voices remains the fallback for a hand-rolled install that
+        // still points the template at the legacy directory.
         if self.is_piper() {
-            // Check if the piper-voices directory exists
-            let data_dir = Self::data_dir();
+            let engine_voices = std::path::PathBuf::from(Self::engine_dir())
+                .join("piper")
+                .join("voices");
+            let data_dir = if engine_voices.exists() {
+                engine_voices.to_string_lossy().into_owned()
+            } else {
+                Self::data_dir()
+            };
             let data_path = std::path::Path::new(&data_dir);
             if !data_path.exists() {
                 log::warn!("[CLI TTS] Piper voices directory not found: {}", data_dir);
@@ -896,6 +950,9 @@ mod tests {
                 "{output}".into(),
             ],
         );
+        // Piper gets no extra flag here: the first-class template already
+        // points at an absolute wrapper path inside the engine dir, which is
+        // what makes voice resolution independent of the launch directory.
         assert_eq!(
             backend.serve_args("en_US-amy-medium"),
             vec![
@@ -907,6 +964,27 @@ mod tests {
                 "--serve"
             ]
         );
+    }
+
+    #[test]
+    fn test_piper_template_resolves_voices_from_the_engine_dir() {
+        // The invariant that fixes "voice model not found ... Available: []":
+        // the first-class Piper template must name the wrapper by an absolute
+        // `{engine_dir}` path, never a CWD-relative one. A relative path made
+        // the wrapper resolve `voices/` against whatever directory the app was
+        // launched from.
+        let piper = CliTtsBackend::new(
+            "uv".into(),
+            vec![
+                "run".into(),
+                "{engine_dir}/piper/scripts/copyspeak-piper.py".into(),
+                "--voice".into(),
+                "{voice}".into(),
+            ],
+        );
+        let args = piper.build_args("in.txt", "out.wav", "en_US-amy-medium", "");
+        assert_eq!(args[1], format!("{}/piper/scripts/copyspeak-piper.py", CliTtsBackend::engine_dir()));
+        assert!(std::path::Path::new(&args[1]).is_absolute());
     }
 
     #[test]

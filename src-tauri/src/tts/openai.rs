@@ -92,7 +92,10 @@ impl TtsBackend for OpenAiTtsBackend {
                         .send()
                         .await
                         .map_err(|e| {
-                            TtsError::Http(format!("OpenAI stream request failed: {e}"))
+                            TtsError::Http(format!(
+                                "OpenAI stream request failed: {}",
+                                super::error_chain(&e)
+                            ))
                         })?;
                     let status = response.status();
                     if !status.is_success() {
@@ -104,7 +107,8 @@ impl TtsBackend for OpenAiTtsBackend {
                     let mut total_bytes = 0usize;
                     while let Some(chunk) = response.chunk().await.map_err(|e| {
                         TtsError::Http(format!(
-                            "OpenAI stream read failed after {total_bytes} bytes: {e}"
+                            "OpenAI stream read failed after {total_bytes} bytes: {}",
+                            super::error_chain(&e)
                         ))
                     })? {
                         if chunk.is_empty() {
@@ -186,7 +190,7 @@ impl TtsBackend for OpenAiTtsBackend {
         .map_err(|e| {
             let elapsed = start_time.elapsed();
             log::error!("OpenAI TTS request failed after {:?}: {}", elapsed, e);
-            TtsError::Http(format!("Request failed: {}", e))
+            TtsError::Http(format!("Request failed: {}", super::error_chain(&e)))
         })?;
 
         let elapsed = start_time.elapsed();
@@ -212,7 +216,7 @@ impl TtsBackend for OpenAiTtsBackend {
 
         let bytes = Self::block_on_async(async { response.bytes().await }).map_err(|e| {
             log::error!("Failed to read response bytes: {}", e);
-            TtsError::Http(format!("Failed to read bytes: {}", e))
+            TtsError::Http(format!("Failed to read bytes: {}", super::error_chain(&e)))
         })?;
 
         log::info!(

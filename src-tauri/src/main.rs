@@ -34,6 +34,16 @@ pub static ACTIVE_CLI_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Flag set when synthesis abort is requested.
 pub static ABORT_REQUESTED: AtomicBool = AtomicBool::new(false);
+pub static ABORT_GENERATION: AtomicU32 = AtomicU32::new(0);
+/// Serializes whole abort transactions.
+///
+/// An abort bumps the generation, then spends time on side effects (killing the
+/// CLI child is a blocking `taskkill`). Without this lock two overlapping
+/// aborts can interleave: the earlier one, resuming late, would still set
+/// `ABORT_REQUESTED`, clear the fragment queue and emit `playback-stop` — which
+/// cancels the newest replacement. Holding this across the whole transaction
+/// makes each abort's cancellation apply completely before the next begins.
+static ABORT_TRANSACTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn update_tray_icon(app_handle: &tauri::AppHandle) {
     if let Some(tray) = app_handle.tray_by_id("main") {
@@ -257,9 +267,21 @@ fn try_register_hotkey(
 }
 
 /// Abort any in-progress synthesis and stop playback.
-/// Called from the abort_synthesis command and tray icon click handler.
-pub fn do_abort_synthesis(app: &tauri::AppHandle) {
+/// Called from the abort_synthesis and stop_speaking commands, the tray icon
+/// click handler, and the queued-reading retrigger path.
+///
+/// Returns the abort generation this call produced. A caller that is about to
+/// start a *replacement* reading adopts it as its baseline: because the value
+/// belongs to this increment, a second abort racing alongside cannot be
+/// mistaken for it, which is what keeps last-writer-wins honest.
+pub fn do_abort_synthesis(app: &tauri::AppHandle) -> u32 {
+    // Recover rather than panic: this runs on the abort path, and a poisoned
+    // lock must not take down the app that the abort exists to steady.
+    let _transaction = ABORT_TRANSACTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     log::info!("[Abort] Aborting synthesis");
+    let generation = ABORT_GENERATION.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
 
     // Kill CLI process if running
     let pid = ACTIVE_CLI_PID.load(Ordering::Relaxed);
@@ -271,12 +293,24 @@ pub fn do_abort_synthesis(app: &tauri::AppHandle) {
     // Signal abort to synthesis tasks
     ABORT_REQUESTED.store(true, Ordering::Relaxed);
 
+    // Stop the fragment queue so speak_queued's per-fragment check ends the
+    // reading instead of synthesizing every remaining fragment.
+    {
+        let queue = app.state::<std::sync::Mutex<fragment_queue::FragmentQueue>>();
+        // Bind the lock result before matching: an `if let` on the temporary
+        // would keep the guard borrowed past `queue`'s drop.
+        let guard = queue.lock();
+        if let Ok(q) = guard {
+            q.stop();
+            q.clear();
+        }
+    }
+
     // Reset synthesis state
     {
         let status = app.state::<JobStatus>();
         status.is_synthesizing.store(false, Ordering::Relaxed);
     }
-    update_tray_icon(app);
     let _ = app.emit("synthesis-state-change", false);
 
     // Emit abort event for frontend feedback
@@ -291,6 +325,15 @@ pub fn do_abort_synthesis(app: &tauri::AppHandle) {
             p.set_playing_entry_id(None);
         };
     }
+
+    // Release the transaction before the tray refresh: `set_icon` marshals onto
+    // the UI thread and waits, so a tray click that is itself blocked on this
+    // mutex would otherwise deadlock. The refresh only reads state this call
+    // has already updated, and recomputes it, so running it unlocked is safe.
+    drop(_transaction);
+    update_tray_icon(app);
+
+    generation
 }
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -305,10 +348,45 @@ use tauri::{
 use tauri::Listener;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
+/// The Windows AppUserModelID. Must match the `identifier` in tauri.conf.json
+/// so the taskbar can tie a pinned button to this process.
+#[cfg(target_os = "windows")]
+const APP_USER_MODEL_ID: &str = "com.copyspeak.tts";
+
+/// Give the process an explicit AppUserModelID on Windows.
+///
+/// Without this the taskbar has no stable identity to attach a pin to, so a
+/// button pinned to the taskbar loses its icon (and stops grouping with running
+/// instances) once the main window hides to the tray. Tauri does not set this
+/// for you. Must match the identifier in tauri.conf.json.
+#[cfg(target_os = "windows")]
+fn set_windows_app_user_model_id() {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+    // Bind the HSTRING to a local so the wide buffer outlives the call, then
+    // pass it as a PCWSTR (the form windows-core 0.58 accepts).
+    let app_id = HSTRING::from(APP_USER_MODEL_ID);
+    // SAFETY: `app_id` is a live HSTRING for the whole call, so the PCWSTR
+    // points at valid, null-terminated UTF-16. The function only reads it.
+    let result = unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(app_id.as_ptr())) };
+    match result {
+        Ok(()) => log::info!("[App] AppUserModelID set to {APP_USER_MODEL_ID}"),
+        Err(e) => log::warn!("[App] Failed to set AppUserModelID: {e}"),
+    }
+}
+
+/// No-op on non-Windows platforms (kept call-site unconditional).
+#[cfg(not(target_os = "windows"))]
+fn set_windows_app_user_model_id() {}
+
 fn main() {
     if let Err(e) = logging::init_logging() {
         eprintln!("Failed to initialize logging: {}", e);
     }
+
+    // Identify the process to the Windows taskbar before any window is created.
+    set_windows_app_user_model_id();
 
     // Linux: Wayland toplevels cannot self-position (tao set_position is
     // silently ignored), so the HUD needs XWayland. WEBKIT_DISABLE_COMPOSITING_MODE
@@ -425,7 +503,7 @@ fn main() {
             let version_item = MenuItem::with_id(
                 app,
                 "version",
-                format!("CopySpeak v{version}"),
+                format!("X-CopySpeak v{version}"),
                 false,
                 None::<&str>,
             )?;
@@ -457,7 +535,7 @@ fn main() {
             let toggle_item_for_event = toggle_item.clone();
             let _tray = TrayIconBuilder::with_id("main")
                 .menu(&menu)
-                .tooltip("CopySpeak")
+                .tooltip("X-CopySpeak")
                 .icon(app.default_window_icon().unwrap().clone())
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
@@ -539,6 +617,13 @@ fn main() {
                         if is_synthesizing {
                             // Abort synthesis when tray icon clicked during synthesis
                             do_abort_synthesis(app);
+                            // The tray click is a user Stop: end any browser
+                            // companion session too, including one that has not
+                            // spoken yet (the frontend does not report those).
+                            browser_bridge::end_active_browser_reading(
+                                app,
+                                browser_bridge::SessionStatus::Cancelled,
+                            );
                         } else if is_playing {
                             // Toggle pause when tray icon clicked during playback
                             let _ = app.emit("playback-toggle-pause", ());
@@ -745,38 +830,6 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(move |app, _shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
-                        log::info!("Global hotkey triggered: speak from clipboard");
-                        let app_handle = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let config: State<std::sync::Mutex<config::AppConfig>> =
-                                app_handle.state();
-                            let player: State<std::sync::Mutex<audio::AudioPlayer>> =
-                                app_handle.state();
-                            let history: State<std::sync::Mutex<history::HistoryLog>> =
-                                app_handle.state();
-                            let telemetry_state: State<std::sync::Mutex<telemetry::TelemetryLog>> =
-                                app_handle.state();
-                            if let Err(e) = commands::speak_now(
-                                app_handle.clone(),
-                                config,
-                                player,
-                                history,
-                                telemetry_state,
-                                None,
-                            )
-                            .await
-                            {
-                                log::error!("Failed to speak from hotkey: {}", e);
-                            }
-                        });
-                    }
-                })
-                .build(),
-        )
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::set_config,

@@ -112,6 +112,23 @@ impl TtsBackend for EdgeTtsBackend {
             let stdout = String::from_utf8_lossy(&result.stdout);
             log::error!("[Edge-TTS] stderr: {}", stderr.trim());
             log::error!("[Edge-TTS] stdout: {}", stdout.trim());
+            // A 403 reaching here means the wrapper already retried Microsoft's
+            // current Read Aloud host and was refused there too. It is reported
+            // specially because the raw aiohttp traceback invites remedies that
+            // do not apply: nothing on PATH is upgradable (the version is pinned
+            // and compiled in), and Microsoft keeps changing the handshake.
+            if stderr.contains("[edge] both-endpoints-denied: HTTP 403") {
+                return Err(TtsError::Unavailable(
+                    "Microsoft Edge (Read Aloud) refused this client with HTTP 403 on both \
+                     of its hosts. This is a change on Microsoft's side, not a local \
+                     setting: CopySpeak pins the newest edge-tts release (7.2.8) and \
+                     already retries the newer host, so there is nothing here to \
+                     upgrade or clear. The block is often regional, so it may work \
+                     intermittently or from another network. Use a local engine \
+                     instead — Kokoro is offline, free, and the fresh-install default."
+                        .into(),
+                ));
+            }
             return Err(TtsError::CommandFailed(format!(
                 "edge-tts exit {}: {}",
                 result.status,

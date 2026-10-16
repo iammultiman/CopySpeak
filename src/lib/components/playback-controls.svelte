@@ -1,19 +1,22 @@
 <script lang="ts">
   import { Button } from "$lib/components/ui/button/index.js";
   import { Spinner } from "$lib/components/ui/spinner/index.js";
-  import { Play, Square, RotateCcw } from "@lucide/svelte";
+  import { Play, Pause, Square, RotateCcw } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
   type PlayMode = "play" | "replay" | "history" | "disabled";
 
-  let { isPlaying, isSynthesizing, playMode, onPlay, onStop, onAbort } = $props<{
-    isPlaying: boolean;
-    isSynthesizing: boolean;
-    playMode: PlayMode;
-    onPlay: () => void;
-    onStop: () => void;
-    onAbort: () => void;
-  }>();
+  let { isPlaying, isPaused, isSynthesizing, playMode, onPlay, onStop, onAbort, onTogglePause } =
+    $props<{
+      isPlaying: boolean;
+      isPaused: boolean;
+      isSynthesizing: boolean;
+      playMode: PlayMode;
+      onPlay: () => void;
+      onStop: () => void;
+      onAbort: () => void;
+      onTogglePause: () => void;
+    }>();
 
   const canStop = $derived(isPlaying || isSynthesizing);
 </script>
@@ -32,3 +35,14 @@
     />{:else if playMode === "replay"}<RotateCcw />{:else}<Play />{/if}
   {canStop ? $_("play.stop") : playMode === "replay" ? $_("play.replay") : $_("play.play")}
 </Button>
+
+{#if isPlaying}
+  <Button
+    variant="secondary"
+    onclick={onTogglePause}
+    title={isPaused ? $_("play.resumeTooltip") : $_("play.pauseTooltip")}
+  >
+    {#if isPaused}<Play />{:else}<Pause />{/if}
+    {isPaused ? $_("play.resume") : $_("play.pause")}
+  </Button>
+{/if}

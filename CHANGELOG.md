@@ -7,6 +7,160 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Identify X-CopySpeak as the maintained fork, document the changes through
+  0.2.14 with separate user-confirmed and automated-check statuses, and clarify
+  installation, updater limitations, compatibility identifiers and deferred work.
+- Remove machine-specific documentation and development paths; keep local
+  artifacts, environments and diagnostic output out of source control.
+
+## [0.2.14] - 2026-10-15
+
+### Fixed
+
+- Keep desktop audio from claiming a waiting browser reading in Queue After
+  Current mode. Batch and PCM audio carry their browser reading ID through
+  delivery, playback and audible progress; unowned audio cannot complete the
+  browser session, even when the text and fragment indices are identical.
+- Retry transient synthesis failures up to twice with 500 ms and 1 s backoff,
+  observing Stop and replacement while waiting. Streamed sections retry only
+  before audio is emitted, preventing repeated speech after a partial failure.
+- Report unrecovered section failures globally as an incomplete reading rather
+  than silently ending a double-copy article. Buffered audio may finish, but the
+  error remains visible and names the section, and the message states plainly
+  that the rest of the passage was not read.
+- Report synthesis failures on the short-text and pagination-disabled routes too
+  (Play page, hotkey, tray, selection, control server), which previously only
+  logged the error to the console.
+- Retry a transient failure even when a permanent HTTP status appears earlier in
+  the same error. edge-tts reports `No audio was received` alongside the refused
+  handshake's `403`, so the previous first-status-token rule classed that
+  transient failure as permanent and never retried it. Edge service availability
+  is still subject to Microsoft's endpoint refusals, which no local change fixes.
+- Keep a transport failure's cause in the error text. reqwest prints only the
+  error kind (`error sending request`), so timeouts and dropped connections read
+  as a bare kind and were not recognised as retryable. The reason chain is now
+  flattened into the message.
+- Treat provider status errors (`ElevenLabs API error 503`, `Cartesia API error
+503`, ...) as retryable, which the earlier check missed because the text
+  contains neither `http` nor `status`.
+- Keep the browser companion bar up for audio that has been delivered but is not
+  audible yet, not only for audio that has started playing, when a later section
+  fails.
+- Carry a browser reading's id through start, progress and finish, so a delayed
+  report from a reading the user already replaced cannot end or move its
+  replacement, and only one session can be active at a time.
+- Do not end a browser reading on a stop that arrives before it has produced any
+  audio: retriggering in Interrupt mode aborts the previous playback while the
+  new reading is still silent, and that abort used to close the new session.
+- End a browser reading on an explicit Stop or Abort (buttons, hotkey, tray) even
+  when it has not spoken yet, so the companion bar does not linger. The frontend
+  cannot tell that Stop apart from the retrigger teardown above, so the stop
+  commands close the session directly.
+- Keep the browser companion bar and word highlights on the page while buffered
+  audio is still speaking after a mid-article failure, instead of tearing them
+  off the moment synthesis reports the error.
+- Show clipboard length-limit warnings on every main-window route, not only
+  the Play page. The configured limit itself remains unchanged.
+
+## [0.2.13] - 2026-10-11
+
+### Fixed
+
+- **Local engines are warmed after a profile or settings change.** Background
+  prewarming only ran at app launch, so switching to Kokoro (or any local
+  engine) made the first reading wait out the whole model load. Selecting a
+  profile, or saving a voice/device setting, now starts that engine's resident
+  daemon in the background. Combined with the effect change below, Kokoro's
+  first audio arrives close to the model's own time-to-first-window instead of
+  after the whole fragment.
+- **Kokoro plays while it synthesizes again.** The bundled Kokoro profile
+  shipped with an effect enabled, and an enabled effect forces the fragment path
+  because the streaming PCM scheduler has no effect chain — so the entire
+  fragment had to finish before any audio played. The bundled profile now ships
+  with no effect, matching what `install-kokoro.ps1` has always written, so the
+  streaming fast path applies. Kokoro also yields one chunk per native inference
+  window instead of joining the whole fragment first, so playback starts after
+  the first window.
+- **Piper no longer fails with "voice model not found ... Available: []".**
+  Piper profiles installed before it became a first-class engine were left on
+  the generic `Local` preset (only Pocket ever had a promotion), so they ran
+  through the CLI path with no daemon and a stale template. Those profiles are
+  now promoted when their command matches the installer template, resolving the
+  installed wrapper from the engine directory. Custom commands are preserved,
+  and already-installed wrappers do not receive a new unsupported argument.
+- **Gemini TTS requests updated for the current model.** Requests now anchor the
+  model to "read this aloud, do not answer it", which is what the API means by
+  "make sure your instructions are clear to only generate audio"; without it a
+  clipboard snippet that reads like a question made the model produce text and
+  the API answered HTTP 400. The bundled default moved from the deprecated
+  `gemini-2.5-flash-preview-tts` (Google shutdown 2026-11-17) to
+  `gemini-3.8-flash-tts`, and unary replies that already carry a RIFF header are
+  no longer wrapped in a second one.
+- **Edge-TTS retries Microsoft's current host before giving up.** Read Aloud
+  began refusing the legacy host with a 403 handshake in some regions, while the
+  newer host accepts the same pinned client. The wrapper now tries the legacy
+  host first and retries the current one only when the handshake is refused, so
+  working regions keep the existing path and blocked ones can try the alternate
+  endpoint. An explicit double-403 marker means both hosts refused; the message
+  says so instead of surfacing a raw traceback that invites remedies that cannot apply
+  (upgrading `edge-tts`, clearing the `uv` cache — the pinned 7.2.8 is already
+  the newest and nothing on `PATH` is upgradable).
+- Stop and retrigger release a reading waiting for a local engine's background
+  model load. Shared prewarming may continue for the next reading, but a
+  cancelled reading no longer launches a one-shot fallback.
+- Local daemon response-header waits now observe cancellation and a deadline;
+  cancelled requests terminate their daemon and release its slot. Model startup
+  handshakes also have a five-minute deadline.
+- Batch collection used by local engines with streaming disabled or effects
+  enabled now observes cancellation while waiting for audio.
+
+## [0.2.12] - 2026-10-10
+
+### Fixed
+
+- **"Stop and restart" now interrupts every trigger**, not just double-copy. The
+  global hotkey, Play page, tray menu, text selection, and the local control
+  server previously queued a new reading behind the one in progress no matter
+  what the setting said; all of them now abort the running reading and start the
+  new text when `on_retrigger` is `interrupt`. `queue` is unchanged.
+- **A replaced reading can no longer publish into its replacement.** Audio,
+  history rows, caption sidecars, saved files and the Replay cache are all gated
+  on the reading still being current, so a fragment that finished synthesizing
+  just as a retrigger landed no longer plays over the new reading or leaves
+  orphan entries behind.
+- **History re-speak joined the cancellation protocol.** It previously cleared
+  the abort flag unconditionally and skipped the reading lock, so replaying a
+  history item during a retrigger could let the replaced reading run on. An
+  unknown or deleted history id also no longer stops whatever is playing just to
+  report "not found".
+- **A stalled engine can no longer pin the app.** Streamed synthesis now polls
+  for cancellation instead of blocking indefinitely on a wedged daemon or hung
+  HTTP body, so a retrigger still starts promptly.
+- Overlapping aborts are serialized, so an earlier abort resuming late cannot
+  cancel the newest reading.
+
+### Changed
+
+- The local control server handles connections concurrently (so a second
+  `/speak` can interrupt the first) and caps concurrent handlers to avoid
+  unbounded thread growth.
+- Bumped X-CopySpeak to 0.2.12 so the Windows test installer is newer than
+  0.2.11. Test installers remain unsigned and do not update from upstream
+  releases.
+
+## [0.2.11] - 2026-10-07
+
+### Fixed
+
+- Settings now saves "Stop and restart" as `interrupt`, matching the backend retrigger enum. Removed the unsupported "Ignore new trigger" choice and added typed options, input validation, and regression tests.
+
+### Changed
+
+- Bumped X-CopySpeak to 0.2.11 so the Windows test installer is newer than CopySpeak 0.2.10. Existing settings, engines, and application identity are retained.
+- Windows test artifacts include the app version in their name. Test installers remain unsigned and do not update from upstream releases.
+
 ## [0.2.8] - 2026-09-25
 
 ### Added

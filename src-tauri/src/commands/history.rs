@@ -783,6 +783,7 @@ pub async fn play_history_batch(
         let _ = app.emit(
             "audio-fragment-ready",
             crate::commands::AudioFragmentEvent {
+                browser_reading_id: None,
                 audio_base64,
                 fragment_index: index,
                 fragment_total: total,

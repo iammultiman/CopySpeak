@@ -29,9 +29,10 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::stream::{AudioFormatMeta, ChunkItem, ChunkStream};
 
@@ -40,6 +41,16 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// How long a daemon start may wait for the wrapper's `READY 2` handshake.
+/// Generous, because the wrapper prints it only after its model has loaded —
+/// this is a backstop against a wrapper that will *never* print it (a wedged
+/// interpreter), not a load deadline.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Poll interval while waiting for an in-flight daemon start to settle. Also the
+/// worst-case delay before a Stop or retrigger is noticed during start-up.
+const START_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Engines that can run a resident wrapper.
 pub const DAEMON_ENGINES: [&str; 5] = ["piper", "kitten", "qwen", "kokoro", "pocket"];
@@ -54,6 +65,25 @@ struct Daemon {
 }
 
 impl Daemon {
+    fn begin_cancellable(
+        mut self,
+        text: String,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<(Self, AudioFormatMeta), String> {
+        let pid = self.child.id();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = self.begin(&text).map(|meta| (self, meta));
+            let _ = tx.send(result);
+        });
+        let result = wait_for_reply(&rx, HANDSHAKE_TIMEOUT, is_cancelled);
+        if result.is_err() {
+            terminate_daemon(pid);
+        }
+        let _ = worker.join();
+        result?
+    }
+
     /// Send one synthesis request and read the format header.
     fn begin(&mut self, text: &str) -> Result<AudioFormatMeta, String> {
         let request = serde_json::json!({ "text": text });
@@ -180,9 +210,59 @@ fn read_handshake(stdout: &mut BufReader<ChildStdout>) -> Result<(), String> {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            terminate_daemon(self.child.id());
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn terminate_daemon(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status();
+    }
+    #[cfg(not(unix))]
+    crate::kill_process_tree(pid);
+}
+
+fn wait_for_reply<T>(
+    receiver: &mpsc::Receiver<T>,
+    timeout: Duration,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<T, String> {
+    let started = Instant::now();
+    loop {
+        if is_cancelled() {
+            return Err("daemon request cancelled".into());
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err("daemon response timed out".into());
+        }
+        match receiver.recv_timeout(remaining.min(START_POLL_INTERVAL)) {
+            Ok(value) => {
+                if is_cancelled() {
+                    return Err("daemon request cancelled".into());
+                }
+                return Ok(value);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("daemon response worker disconnected".into());
+            }
+        }
+    }
+}
+
+/// Whether the current reading has been cancelled (a Stop, or a retrigger that
+/// replaced it). Start-up polls this so a cold model load cannot hold the shared
+/// reading lock after the user has moved on.
+fn cancelled() -> bool {
+    crate::ABORT_REQUESTED.load(Ordering::Relaxed)
 }
 
 #[derive(Default)]
@@ -221,6 +301,11 @@ fn start(key: String, command: &str, serve_args: &[String]) -> Result<Daemon, St
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     #[cfg(windows)]
     {
         cmd.creation_flags(CREATE_NO_WINDOW);
@@ -229,7 +314,7 @@ fn start(key: String, command: &str, serve_args: &[String]) -> Result<Daemon, St
 
     let mut child = cmd.spawn().map_err(|e| format!("{command}: {e}"))?;
     let stdin = child.stdin.take().ok_or("no stdin pipe")?;
-    let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout pipe")?);
+    let stdout = BufReader::new(child.stdout.take().ok_or("no stdout pipe")?);
 
     // Drain stderr so the wrapper never blocks on a full pipe, and so model load
     // failures (and the resolved ONNX providers) reach the log.
@@ -248,15 +333,20 @@ fn start(key: String, command: &str, serve_args: &[String]) -> Result<Daemon, St
         });
     }
 
-    // ponytail: no read timeout — a pre-daemon wrapper rejects `--serve` and
-    // exits, which surfaces as EOF. A wedged interpreter would leak this thread
-    // and permanently disable the daemon; synthesis still works one-shot.
-    let handshake = read_handshake(&mut stdout);
-    if let Err(e) = handshake {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e);
-    }
+    // A pre-daemon wrapper rejects `--serve` and exits, which surfaces
+    // as EOF. A wrapper that starts but never handshakes (wedged interpreter) is
+    // bounded by `HANDSHAKE_TIMEOUT` instead of hanging this slot forever — with
+    // an unbounded read, `pending` was never cleared and every later request for
+    // this engine spun in `wait_for_start` on a start that could not settle.
+    let stdout = match read_handshake_bounded(stdout, HANDSHAKE_TIMEOUT) {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            terminate_daemon(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
 
     Ok(Daemon {
         key,
@@ -264,6 +354,33 @@ fn start(key: String, command: &str, serve_args: &[String]) -> Result<Daemon, St
         stdin,
         stdout,
     })
+}
+
+/// Read the v2 handshake with a deadline, returning the reader so the daemon
+/// keeps its exact pipe position on success.
+///
+/// The read runs on a helper thread because a blocking pipe read has no portable
+/// timeout. On timeout the caller kills the child, which closes the pipe and
+/// unblocks that helper (it then sends to a dropped channel and exits), so the
+/// wedged wrapper cannot leak either the thread or the slot.
+fn read_handshake_bounded(
+    mut stdout: BufReader<ChildStdout>,
+    timeout: Duration,
+) -> Result<BufReader<ChildStdout>, String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = read_handshake(&mut stdout);
+        let _ = tx.send((result, stdout));
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok((Ok(()), stdout)) => Ok(stdout),
+        Ok((Err(e), _)) => Err(e),
+        Err(_) => Err(format!(
+            "no READY within {}s (wrapper did not load its model)",
+            timeout.as_secs()
+        )),
+    }
 }
 
 /// Start the daemon in the background unless one is already running (or starting,
@@ -315,11 +432,16 @@ pub fn is_ready(engine: &str) -> bool {
 }
 
 /// Block until any in-flight start for this engine settles (daemon ready,
-/// start failed, or a different config took over). Unbounded by design: the
-/// start thread owns the whole outcome, the caller just re-reads the slot.
-/// Config changes during the wait flip `pending` to the new key, which no
-/// longer matches and falls through to the normal take-or-one-shot path.
-fn wait_for_start(engine: &str, key: &str) {
+/// start failed, or a different config took over). The start thread owns the
+/// whole outcome, so the caller just re-reads the slot; a config change during
+/// the wait flips `pending` to the new key, which no longer matches and falls
+/// through to the normal take-or-one-shot path.
+///
+/// Also returns early once the reading is cancelled. A cold model load can take
+/// tens of seconds, and a Stop or retrigger during it must not keep the shared
+/// reading lock — and the user's next reading — waiting. The returned flag says
+/// which happened, so the caller can skip the run-it-again one-shot fallback.
+fn wait_for_start(engine: &str, key: &str) -> bool {
     loop {
         {
             let guard = slots();
@@ -332,10 +454,14 @@ fn wait_for_start(engine: &str, key: &str) {
                 None => true,
             };
             if settled {
-                return;
+                return false;
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
+        if cancelled() {
+            log::info!("[LocalDaemon] {engine} start abandoned: reading cancelled");
+            return true;
+        }
+        std::thread::sleep(START_POLL_INTERVAL);
     }
 }
 
@@ -353,7 +479,7 @@ pub fn try_stream(
     // Check the daemon out of the registry for the duration of the stream. Owning
     // it outright (rather than holding the mutex) keeps the lock short and makes
     // two requests interleaving on one pipe impossible.
-    let mut daemon = {
+    let daemon = {
         let mut guard = slots();
         let slot = guard.entry(engine.to_string()).or_default();
         // A start thread for this exact config is still loading the model.
@@ -365,7 +491,13 @@ pub fn try_stream(
                 "[LocalDaemon] {engine} daemon is loading for this config; waiting instead of one-shot"
             );
             drop(guard);
-            wait_for_start(engine, &key);
+            let cancelled = wait_for_start(engine, &key);
+            if cancelled {
+                // The reading was replaced while the model loaded. Starting a
+                // one-shot now would spawn a second model copy for a reading the
+                // user has already moved on from.
+                return None;
+            }
             guard = slots();
         }
         let slot = guard.entry(engine.to_string()).or_default();
@@ -387,11 +519,10 @@ pub fn try_stream(
         }
     };
 
-    let meta = match daemon.begin(text) {
-        Ok(meta) => meta,
+    let (mut daemon, meta) = match daemon.begin_cancellable(text.to_string(), cancelled) {
+        Ok(reply) => reply,
         Err(e) => {
             log::warn!("[LocalDaemon] {engine} request failed ({e}); falling back to one-shot");
-            drop(daemon); // kills the process; the next call re-warms
             slots().entry(engine.to_string()).or_default().busy = false;
             return None;
         }
@@ -443,6 +574,54 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_reply_wait_does_not_wait_for_a_silent_worker() {
+        let (_sender, receiver) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let error = wait_for_reply(&receiver, HANDSHAKE_TIMEOUT, || true).unwrap_err();
+        assert!(error.contains("cancelled"));
+        assert!(started.elapsed() < START_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn reply_wait_rechecks_cancellation_after_a_poll() {
+        let (_sender, receiver) = mpsc::channel::<()>();
+        let polls = std::cell::Cell::new(0);
+        let error = wait_for_reply(&receiver, HANDSHAKE_TIMEOUT, || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        })
+        .unwrap_err();
+        assert!(error.contains("cancelled"));
+        assert!(polls.get() > 1);
+    }
+
+    #[test]
+    fn reply_wait_has_a_deadline_and_preserves_ready_values() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(42).unwrap();
+        assert_eq!(wait_for_reply(&receiver, HANDSHAKE_TIMEOUT, || false), Ok(42));
+        assert!(wait_for_reply(&receiver, Duration::from_millis(10), || false)
+            .unwrap_err()
+            .contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_header_wait_terminates_and_reaps_the_daemon() {
+        let args = vec![
+            "-c".into(),
+            "printf 'READY 2\\n'; read request; exec cat".into(),
+        ];
+        let daemon = start("header-test".into(), "sh", &args).unwrap();
+        let polls = std::cell::Cell::new(0);
+        let result = daemon.begin_cancellable("test".into(), || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        });
+        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+    }
 
     #[test]
     fn key_distinguishes_command_and_args() {

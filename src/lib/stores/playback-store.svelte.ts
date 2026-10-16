@@ -21,6 +21,7 @@ import { FragmentQueue, type QueuedFragment } from "./playback/fragment-queue.js
 import { hudStore } from "./hud-store.svelte.js";
 import { validCaptionAlignment, type CaptionAlignment } from "$lib/models/captions.js";
 import type { HudCaptionPayload } from "$lib/types/hud.js";
+import { toast } from "svelte-sonner";
 
 class PlaybackStore {
   isPlaying = $state(false);
@@ -56,13 +57,19 @@ class PlaybackStore {
   private _stopping = false;
   private _playbackGeneration = 0;
   private _readingText = "";
+  private _readingFailure: string | null = null;
   private _fragmentCaptions: CaptionAlignment | null = null;
   private _streamStopped = false;
+  // Last browser-bridge progress report (ms clock + wall time). The caption
+  // clock ticks at 40 Hz; round-tripping every tick to Rust for browser
+  // readings flooded IPC and stuttered playback, so reports are throttled.
+  private _lastBrowserReportMs = -1;
+  private _lastBrowserReportAt = 0;
   private _fragmentText = "";
   private _captionTimer: ReturnType<typeof setInterval> | null = null;
   private _lastCaption: HudCaptionPayload | null = null;
   private _streamCaptions = new Map<
-    number,
+    string,
     { text: string; durationMs: number; captions?: CaptionAlignment | null }
   >();
 
@@ -74,7 +81,21 @@ class PlaybackStore {
   // Browser companion: while a browser-initiated reading is active, the
   // audible-clock position is reported to the Rust bridge, which projects the
   // current word into the page selection (see src-tauri/src/browser_bridge.rs).
+  // The id identifies which session each report belongs to, so a late report or
+  // terminal event from a superseded reading cannot end or move its replacement.
   private _browserReadingActive = false;
+  private _browserReadingId: string | null = null;
+  private _playingBrowserReadingId: string | null = null;
+  /**
+   * Whether the tracked browser reading has produced audio yet.
+   *
+   * A retrigger in Interrupt mode aborts the *previous* playback to start this
+   * one, so that abort's `synthesis-state-change: false`, `playback-stop` and
+   * `synthesis-aborted` arrive while this reading is active but silent. Those
+   * events belong to the reading that was replaced and must not tear this one
+   * down before it has spoken.
+   */
+  private _browserReadingStarted = false;
 
   constructor() {
     // Initialize fragment queue with handlers
@@ -92,7 +113,7 @@ class PlaybackStore {
         this._fragmentCaptions = validCaptionAlignment(fragment.captions)
           ? fragment.captions
           : null;
-        await this.handleAudioReady(fragment.audioBase64);
+        await this.handleAudioReady(fragment.audioBase64, fragment.browserReadingId);
       },
       onQueueComplete: () => {
         console.log("[PlaybackStore] onQueueComplete");
@@ -137,9 +158,27 @@ class PlaybackStore {
 
   private publishCaption() {
     let caption: HudCaptionPayload | null = null;
+    let audibleBrowserReadingId = this._playingBrowserReadingId;
     if (this._pcmScheduler) {
       const position = this._pcmScheduler.getPlaybackPosition();
-      const fragment = position ? this._streamCaptions.get(position.fragmentIndex) : null;
+      // The audible source owns progress and completion, not the most recently
+      // arrived chunk: browser PCM can buffer behind desktop PCM in the same
+      // scheduler, and reporting arrival as playback would end the browser
+      // session while its audio is still queued.
+      if (position) {
+        audibleBrowserReadingId = position.browserReadingId ?? null;
+        this._playingBrowserReadingId = audibleBrowserReadingId;
+        if (this._browserReadingActive && audibleBrowserReadingId === this._browserReadingId) {
+          this._browserReadingStarted = true;
+        }
+      } else {
+        audibleBrowserReadingId = this._playingBrowserReadingId;
+      }
+      const fragment = position
+        ? this._streamCaptions.get(
+            JSON.stringify([position.browserReadingId ?? null, position.fragmentIndex])
+          )
+        : null;
       if (position && fragment) {
         caption = {
           text: fragment.captions?.text ?? fragment.text,
@@ -170,23 +209,35 @@ class PlaybackStore {
       };
     }
     if (!caption) return;
+    const previousPaused = this._lastCaption?.paused ?? false;
     this._lastCaption = caption;
     this.caption = caption;
     hudStore.handleCaption(caption);
     void this._emitTo?.("hud", "hud:caption", caption);
     // Report the audible clock to the browser bridge. Best-effort: the bridge
-    // may not exist (older app build) or no reading may be active.
-    if (this._browserReadingActive) {
-      const fragmentIndex = this._pcmScheduler
-        ? (this._pcmScheduler.getPlaybackPosition()?.fragmentIndex ??
-          this.currentFragmentIndex ??
-          0)
-        : (this.currentFragmentIndex ?? 0);
-      void invoke("browser_reading_progress", {
-        fragmentIndex,
-        positionMs: Math.round(caption.position_ms),
-        paused: caption.paused
-      }).catch(() => {});
+    // may not exist (older app build) or no reading may be active. Skip unless
+    // the clock advanced enough or a pause state changed, so a 40 Hz caption
+    // clock does not become a 40 Hz IPC round-trip.
+    if (this._browserReadingActive && audibleBrowserReadingId === this._browserReadingId) {
+      const now = Date.now();
+      const positionMs = Math.round(caption.position_ms);
+      const pauseChanged = previousPaused !== caption.paused;
+      const advancedEnough = Math.abs(positionMs - this._lastBrowserReportMs) >= 100;
+      if (advancedEnough || pauseChanged || now - this._lastBrowserReportAt >= 500) {
+        const fragmentIndex = this._pcmScheduler
+          ? (this._pcmScheduler.getPlaybackPosition()?.fragmentIndex ??
+            this.currentFragmentIndex ??
+            0)
+          : (this.currentFragmentIndex ?? 0);
+        this._lastBrowserReportMs = positionMs;
+        this._lastBrowserReportAt = now;
+        void invoke("browser_reading_progress", {
+          readingId: this._browserReadingId,
+          fragmentIndex,
+          positionMs,
+          paused: caption.paused
+        }).catch(() => {});
+      }
     }
   }
 
@@ -239,11 +290,12 @@ class PlaybackStore {
     return url;
   }
 
-  async handleAudioReady(base64: string): Promise<void> {
+  async handleAudioReady(base64: string, browserReadingId?: string | null): Promise<void> {
     const generation = this._playbackGeneration;
     this.isLoadingAudio = true;
-    this.error = null;
+    this.error = this._readingFailure;
     this.hasCachedAudio = false;
+    this.markBrowserStarted(browserReadingId);
     try {
       console.log("[PlaybackStore] handleAudioReady called, base64 length:", base64.length);
       const binary = atob(base64);
@@ -307,6 +359,7 @@ class PlaybackStore {
    * Queues the fragment and starts processing if not already.
    */
   async handleFragmentReady(payload: {
+    browser_reading_id?: string | null;
     audio_base64: string;
     fragment_index: number;
     fragment_total: number;
@@ -324,11 +377,13 @@ class PlaybackStore {
     );
     // Add to queue
     this._fragmentQueue.enqueue({
+      browserReadingId: payload.browser_reading_id,
       audioBase64: payload.audio_base64,
       index: payload.fragment_index,
       total: payload.fragment_total,
       text: payload.text,
-      captions: payload.captions
+      captions: payload.captions,
+      isFinal: payload.is_final
     });
     console.log(
       "[PlaybackStore] Queue length:",
@@ -339,6 +394,59 @@ class PlaybackStore {
     if (!this._fragmentQueue.isProcessing()) {
       await this._fragmentQueue.startProcessing();
     }
+  }
+
+  /**
+   * Note that the tracked browser reading has produced audio.
+   *
+   * Learned from the audio handlers themselves, so it is known synchronously —
+   * before any stop or completion event for this reading.
+   */
+  private markBrowserStarted(browserReadingId?: string | null): void {
+    this._playingBrowserReadingId = browserReadingId ?? null;
+    if (this._browserReadingActive && browserReadingId === this._browserReadingId) {
+      this._browserReadingStarted = true;
+    }
+  }
+
+  /**
+   * Whether a reading-lifecycle event belongs to the reading this store is
+   * running, rather than to a reading it replaced.
+   *
+   * A browser reading that has produced no audio yet is still in its replaced
+   * reading's teardown window, so a completion, stop or abort arriving now is
+   * that teardown's. A recorded failure is this reading's own: it is the reason
+   * a silent reading has nothing more to say, and its report must not be
+   * suppressed. A browser reading that has produced no audio and has no failure
+   * is left running; the bridge reaps it only if the frontend stops reporting.
+   */
+  private isCurrentReadingEvent(): boolean {
+    if (!this._browserReadingActive) return true;
+    return this._browserReadingStarted || this._readingFailure !== null;
+  }
+
+  /**
+   * Release the active browser reading to the bridge exactly once.
+   *
+   * `stopped` distinguishes a user/hotkey Stop from a reading that drained
+   * normally; a recorded synthesis failure wins over both, so a failed section
+   * is never reported as a clean completion.
+   *
+   * Only the audio belonging to this browser reading sends a report. The bridge decides whether a `completed` or
+   * `cancelled` may end the session, because it is the authority on whether this
+   * reading actually produced audio: a silent reading was replaced, so the
+   * completion came from the reading it replaced. A user Stop reaches the bridge
+   * through the stop commands instead, so nothing here has to guess.
+   */
+  private reportBrowserEnd(stopped: boolean): void {
+    if (!this._browserReadingActive) return;
+    if (this._playingBrowserReadingId !== this._browserReadingId) return;
+    const readingId = this._browserReadingId;
+    this._browserReadingActive = false;
+    this._browserReadingId = null;
+    this._browserReadingStarted = false;
+    const status = this._readingFailure ? "error" : stopped ? "cancelled" : "completed";
+    void invoke("browser_reading_finished", { readingId, status }).catch(() => {});
   }
 
   /**
@@ -353,10 +461,8 @@ class PlaybackStore {
     this.currentFragmentIndex = null;
     this.totalFragments = null;
     this._pcmScheduler = null;
-    if (this._browserReadingActive) {
-      this._browserReadingActive = false;
-      void invoke("browser_reading_finished", { status: "completed" }).catch(() => {});
-    }
+    this.reportBrowserEnd(false);
+    this._playingBrowserReadingId = null;
     void this._emit?.("hud:stop", null);
   }
 
@@ -367,6 +473,7 @@ class PlaybackStore {
    */
   handleStreamChunk(payload: StreamChunkPayload): void {
     if (this._streamStopped) return;
+    if (payload.audio_base64) this.markBrowserStarted(payload.browser_reading_id);
     if (!this._audioCtx) {
       this._audioCtx = new AudioContext();
     }
@@ -392,14 +499,15 @@ class PlaybackStore {
       this.isPlaying = true;
       this.isPaused = false;
     }
+    const captionKey = JSON.stringify([payload.browser_reading_id ?? null, payload.fragment_index]);
     if (payload.text !== undefined) {
-      this._streamCaptions.set(payload.fragment_index, {
+      this._streamCaptions.set(captionKey, {
         text: payload.text,
         durationMs: 0,
-        captions: this._streamCaptions.get(payload.fragment_index)?.captions
+        captions: this._streamCaptions.get(captionKey)?.captions
       });
     }
-    const caption = this._streamCaptions.get(payload.fragment_index);
+    const caption = this._streamCaptions.get(captionKey);
     if (caption && validCaptionAlignment(payload.captions)) caption.captions = payload.captions;
     if (caption && payload.fragment_duration_ms !== undefined) {
       caption.durationMs = payload.fragment_duration_ms;
@@ -429,6 +537,18 @@ class PlaybackStore {
 
   async handleReplay(): Promise<void> {
     this.historyReadingId = null;
+    // A paginated reading is emitted fragment-by-fragment and never assembled in
+    // the frontend, so `_originalBytes` only holds the last fragment. The whole
+    // reading exists only in the backend cache — ask it to replay that.
+    if (isTauri) {
+      try {
+        await invoke("replay_cached");
+        return;
+      } catch (e) {
+        this.error = `Audio replay failed: ${e instanceof Error ? e.message : String(e)}`;
+        return;
+      }
+    }
     if (!this._audioEl) return;
     const url = await this.buildPlaybackUrl(this.pitch);
     if (url) {
@@ -464,6 +584,13 @@ class PlaybackStore {
     }
     this.isPlaying = false;
     this.isPaused = false;
+    // A Stop also ends any browser reading: a failure after audio was emitted
+    // leaves the session waiting for this report, and without it the session
+    // would stay registered (and could answer a later reading's progress and
+    // finish calls) until the bridge's liveness lease reaped it.
+    this.reportBrowserEnd(true);
+    this._playingBrowserReadingId = null;
+    this._readingFailure = null;
     void this._emit?.("hud:stop", null);
     setTimeout(() => {
       this._stopping = false;
@@ -546,7 +673,8 @@ class PlaybackStore {
           audioBase64: e.payload,
           index: 1,
           total: 1,
-          text: ""
+          text: "",
+          isFinal: true
         });
         if (!this._fragmentQueue.isProcessing()) {
           await this._fragmentQueue.startProcessing();
@@ -555,6 +683,7 @@ class PlaybackStore {
 
       // New streaming fragment-ready event
       const unFragmentReady = await listen<{
+        browser_reading_id?: string | null;
         audio_base64: string;
         fragment_index: number;
         fragment_total: number;
@@ -576,16 +705,35 @@ class PlaybackStore {
         this.handleStreamChunk(e.payload);
       });
 
-      // Authoritative end-of-synthesis signal for the streamed queue; the
-      // scheduler completes once all scheduled sources have drained.
+      // Authoritative end-of-synthesis signal. Route it to whichever player
+      // actually owns playback: PCM streams complete via their scheduler, the
+      // fragment queue completes when its final fragment's audio ends. Signalling
+      // both would let the idle one finish playback early (the fragment queue is
+      // always empty during PCM streaming), which clears the scheduler mid-drain.
       const unPaginationComplete = await listen("pagination:complete", () => {
-        this._pcmScheduler?.markQueueComplete();
+        if (this._pcmScheduler) {
+          this._pcmScheduler.markQueueComplete();
+        } else {
+          this._fragmentQueue.markComplete();
+        }
+      });
+
+      // A reading that ended without reaching its last fragment (mid-reading
+      // stop/abort) must not leave the fragment queue waiting forever.
+      const unPaginationStopped = await listen("pagination:stopped", () => {
+        if (this._pcmScheduler) {
+          this._pcmScheduler.markQueueComplete();
+        } else {
+          this._fragmentQueue.markComplete();
+        }
       });
 
       console.log("[PlaybackStore] All listeners registered");
 
       const unPlaybackStop = await listen("playback-stop", () => {
-        this.handleStop();
+        // Like `synthesis-aborted` above: a silent browser reading must not be
+        // stopped by the teardown of the reading it replaced.
+        if (this.isCurrentReadingEvent()) this.handleStop();
       });
 
       const unTogglePause = await listen("playback-toggle-pause", () => {
@@ -594,9 +742,28 @@ class PlaybackStore {
 
       // Browser companion: the Rust bridge tells us a browser-initiated
       // reading started/ended so we only report positions while relevant.
-      const unBrowserReading = await listen<{ active: boolean }>("browser-reading", (e) => {
-        this._browserReadingActive = e.payload.active === true;
-      });
+      const unBrowserReading = await listen<{ active: boolean; reading_id?: string }>(
+        "browser-reading",
+        (e) => {
+          if (e.payload.active === true) {
+            this._browserReadingActive = true;
+            this._browserReadingId = e.payload.reading_id ?? null;
+            this._browserReadingStarted = false;
+            return;
+          }
+          // This store tracks one reading. A terminal event ends it when it
+          // belongs to that reading; an unscoped one is treated as belonging to
+          // it (an older app build sent no id, and only one session could exist
+          // then). A different id is a superseded reading's, and must not end
+          // the live one.
+          const eventId = e.payload.reading_id;
+          if (eventId === undefined || eventId === null || eventId === this._browserReadingId) {
+            this._browserReadingActive = false;
+            this._browserReadingId = null;
+            this._browserReadingStarted = false;
+          }
+        }
+      );
 
       // Effects/speed/pitch chosen outside the Play page (Effects page, profile
       // switch) only ever reach the backend config; re-sync here so the next
@@ -613,17 +780,51 @@ class PlaybackStore {
         }
       });
 
+      const unReadingFailed = await listen<string>("reading-failed", (event) => {
+        this._readingFailure = event.payload;
+        this.error = event.payload;
+        toast.error(event.payload, { duration: 15000 });
+      });
+
+      const unTruncated = await listen<{
+        original_length: number;
+        truncated_length: number;
+        max_length: number;
+      }>("text-truncated", (event) => {
+        toast.warning(
+          `Copied text was shortened from ${event.payload.original_length} to ${event.payload.truncated_length} characters by the reading limit (${event.payload.max_length}).`,
+          { duration: 15000 }
+        );
+      });
+
       const unSynthesis = await listen<boolean>("synthesis-state-change", (e) => {
         if (e.payload) {
+          this._readingFailure = null;
+          this.error = null;
           this.historyReadingId = null;
           this._streamStopped = false;
+          this._pcmScheduler?.beginReading();
+        } else {
+          // Synthesis ended. If it failed mid-reading, no final fragment (or
+          // pagination:stopped) will ever arrive, so release a starved queue.
+          // A no-op when the final fragment is still queued, so a normal reading
+          // is never cut short.
+          //
+          // A silent browser reading must not act on this: the end belongs to
+          // the reading it replaced, and completing an empty queue here would
+          // run `finishPlayback` and tear the new reading down before it spoke.
+          if (this.isCurrentReadingEvent()) {
+            if (this._pcmScheduler) this._pcmScheduler.markQueueComplete();
+            else this._fragmentQueue.markComplete();
+          }
         }
         this.isSynthesizing = e.payload;
       });
 
       const unAbort = await listen("synthesis-aborted", () => {
-        // Handle abort event from backend - clear queue and stop
-        this.handleStop();
+        // A silent browser reading must not be stopped by the abort of the
+        // reading it replaced (see `isCurrentReadingEvent`).
+        if (this.isCurrentReadingEvent()) this.handleStop();
       });
 
       this._unlistenFns = [
@@ -632,10 +833,13 @@ class PlaybackStore {
         unFragmentReady,
         unStreamChunk,
         unPaginationComplete,
+        unPaginationStopped,
         unPlaybackStop,
         unTogglePause,
         unBrowserReading,
         unConfigChanged,
+        unReadingFailed,
+        unTruncated,
         unSynthesis,
         unAbort
       ];
@@ -645,6 +849,7 @@ class PlaybackStore {
   }
 
   teardownListeners() {
+    this._readingFailure = null;
     this.handleStop();
     this._analyser.stop();
     this._analyser.destroy();

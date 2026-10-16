@@ -1,6 +1,6 @@
 {
-  "productName": "CopySpeak",
-  "version": "0.2.8",
+  "productName": "X-CopySpeak",
+  "version": "0.2.14",
   "identifier": "com.copyspeak.tts",
   "build": {
     "frontendDist": "../dist",
@@ -20,7 +20,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "publisher": "CopySpeak",
+    "publisher": "X-CopySpeak",
     "shortDescription": "Clipboard text-to-speech tool",
     "longDescription": "A lightweight tool for quick AI text-to-speech generation.",
     "category": "Productivity",
@@ -51,7 +51,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "CopySpeak",
+        "title": "X-CopySpeak",
         "width": 775,
         "height": 580,
         "resizable": true,

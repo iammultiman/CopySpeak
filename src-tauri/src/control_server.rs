@@ -5,6 +5,7 @@ use crate::telemetry;
 use serde::Deserialize;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
@@ -12,6 +13,43 @@ use tauri::{AppHandle, Manager, State};
 const DEFAULT_ADDR: &str = "127.0.0.1:43117";
 const MAX_BODY_BYTES: usize = 200_000;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Connection threads allowed at once. The server was moved off the accept loop
+/// so a second `/speak` can interrupt a running one; that made it spawn
+/// unbounded threads, and a local flood could exhaust them. Past this cap a
+/// connection is answered `503` and closed instead of given a thread.
+const MAX_CONNECTIONS: usize = 8;
+
+/// Connection threads currently running, to enforce [`MAX_CONNECTIONS`].
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Releases a connection slot when its handler thread finishes.
+struct ConnectionSlot;
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Claim a connection slot, or `None` when the server is already at its cap.
+fn try_acquire_connection() -> Option<ConnectionSlot> {
+    // Reserve with a CAS loop so two threads cannot both take the last slot.
+    let mut current = ACTIVE_CONNECTIONS.load(Ordering::SeqCst);
+    loop {
+        if current >= MAX_CONNECTIONS {
+            return None;
+        }
+        match ACTIVE_CONNECTIONS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return Some(ConnectionSlot),
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct SpeakRequest {
@@ -46,7 +84,51 @@ pub fn start(app: AppHandle) {
         log::info!("[Control] Listening on http://{}", addr);
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => handle_connection(stream, app.clone()),
+                // Handle each connection on its own thread. The accept loop
+                // used to call `handle_connection` inline, which `block_on`s the
+                // whole synthesis: a second `/speak` could not even reach
+                // `speak_now` until the first finished, so it could never
+                // interrupt it no matter what `on_retrigger` said.
+                Ok(mut stream) => {
+                    // Advisory pre-check on the accept thread so a flood is
+                    // refused without spawning a thread per connection.
+                    if ACTIVE_CONNECTIONS.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                        log::warn!("[Control] At {} connections; refusing another", MAX_CONNECTIONS);
+                        // Bound the refusal write: this runs on the accept thread,
+                        // and a client that stopped reading would otherwise stall
+                        // the loop waiting for the socket buffer to drain.
+                        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                        let _ = stream.write_all(
+                            http_response(503, "Busy", &json_error("too many connections")).as_bytes(),
+                        );
+                        continue;
+                    }
+                    let app = app.clone();
+                    // The slot is claimed *inside* the closure: nothing is held
+                    // before a successful spawn, so a failed spawn cannot leak
+                    // capacity whichever way the runtime drops a never-run
+                    // closure. The claim is authoritative, so two threads racing
+                    // the pre-check above cannot both take the last slot.
+                    // `Builder::spawn` reports failure instead of panicking, so a
+                    // resource-exhausted spawn cannot kill the accept loop.
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("copyspeak-control".into())
+                        .spawn(move || {
+                            let Some(_slot) = try_acquire_connection() else {
+                                let _ = stream
+                                    .set_write_timeout(Some(Duration::from_millis(500)));
+                                let _ = stream.write_all(
+                                    http_response(503, "Busy", &json_error("too many connections"))
+                                        .as_bytes(),
+                                );
+                                return;
+                            };
+                            handle_connection(stream, app);
+                        })
+                    {
+                        log::warn!("[Control] Cannot spawn handler: {error}");
+                    }
+                }
                 Err(error) => log::warn!("[Control] Connection failed: {}", error),
             }
         }
@@ -346,5 +428,43 @@ ab",
         });
 
         judge.join().expect("server-side assertions hold");
+    }
+
+    /// The server moved off the accept loop so a second `/speak` can interrupt a
+    /// running one; the cap is what stops a local flood from spawning threads
+    /// without bound. Exercised serially because it mutates the process-global
+    /// counter, so the assertions are made without contending with live handlers.
+    #[test]
+    fn connection_slots_are_capped_and_released_on_drop() {
+        // Nothing else is running here, so the counter starts at its baseline.
+        let baseline = ACTIVE_CONNECTIONS.load(Ordering::SeqCst);
+
+        let mut held: Vec<ConnectionSlot> = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            held.push(try_acquire_connection().expect("a slot below the cap"));
+        }
+        assert_eq!(
+            ACTIVE_CONNECTIONS.load(Ordering::SeqCst) - baseline,
+            MAX_CONNECTIONS
+        );
+        assert!(
+            try_acquire_connection().is_none(),
+            "the connection past the cap must be refused"
+        );
+
+        // Dropping a handler's slot returns capacity to the next caller.
+        held.pop();
+        let reacquired = try_acquire_connection().expect("capacity returns on drop");
+        assert!(try_acquire_connection().is_none(), "still at the cap");
+
+        drop(reacquired);
+        for slot in held {
+            drop(slot);
+        }
+        assert_eq!(
+            ACTIVE_CONNECTIONS.load(Ordering::SeqCst),
+            baseline,
+            "every slot must be returned when its handler finishes"
+        );
     }
 }

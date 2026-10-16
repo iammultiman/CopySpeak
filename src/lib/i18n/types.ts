@@ -108,7 +108,6 @@ export type TranslationKeys =
   | "settings.playback.pitchDescription"
   | "settings.playback.stopAndRestart"
   | "settings.playback.queueAfterCurrent"
-  | "settings.playback.ignoreNewTrigger"
   | "settings.triggers.title"
   | "settings.triggers.listen"
   | "settings.triggers.listenDescription"
