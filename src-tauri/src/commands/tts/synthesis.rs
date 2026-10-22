@@ -99,7 +99,11 @@ async fn synthesize_async(
                     .map_err(|e| e.to_string())
             }
         },
-        cancelled, || true, Duration::from_millis(500),
+        cancelled,
+        // A backend that just told us the provider refused this request keeps
+        // that verdict: retrying amplifies throttling rather than recovering.
+        || !backend.failure_is_final(),
+        Duration::from_millis(500),
     ).await;
     if cancelled() { Ok(Vec::new().into()) } else { result }
 }
@@ -688,7 +692,7 @@ async fn synthesize_streaming_and_emit(
     .await
     .map_err(|e| format!("Task join error: {e}"))?
     .map(|(wav, _ttfa_ms)| wav) }
-    }, cancelled, || !emitted_audio.load(Ordering::SeqCst), Duration::from_millis(500)).await;
+    }, cancelled, || !emitted_audio.load(Ordering::SeqCst) && !backend.failure_is_final(), Duration::from_millis(500)).await;
     if cancelled() { Ok(Vec::new().into()) } else { result }
 }
 

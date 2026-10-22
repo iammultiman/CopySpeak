@@ -22,6 +22,32 @@ kokoro = load("kokoro/copyspeak-kokoro.py")
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_piper_explicit_voice_directory_is_authoritative(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = Path(root) / "engine"
+            voices = project / "voices"
+            voices.mkdir(parents=True)
+            (voices / "en_US-lessac-medium.onnx").touch()
+            override = Path(root) / "explicit"
+            override.mkdir()
+            with patch.object(piper.sys, "prefix", str(project / ".venv")):
+                with self.assertRaises(FileNotFoundError):
+                    piper.resolve_model("en_US-lessac-medium", str(override))
+                model = override / "en_US-lessac-medium.onnx"
+                model.touch()
+                self.assertEqual(piper.resolve_model("en_US-lessac-medium", str(override)), model)
+
+    def test_piper_finds_voices_in_uv_project_not_wrapper_location(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = Path(root) / "engine"
+            voices = project / "voices"
+            voices.mkdir(parents=True)
+            model = voices / "en_US-lessac-medium.onnx"
+            model.touch()
+            with patch.object(piper.sys, "prefix", str(project / ".venv")), \
+                    patch.object(piper, "__file__", str(Path(root) / "app" / "scripts" / "copyspeak-piper.py")):
+                self.assertEqual(piper.resolve_model("en_US-lessac-medium"), model)
+
     def test_kokoro_native_frames_keep_bos_spaces_punctuation_and_utf16(self):
         tokens = [SimpleNamespace(text=t, whitespace=w, phonemes=p) for t, w, p in
                   [("😀", " ", "a"), ("Hi", "", "hi"), (",", " ", ","), ("there", "", "b")]]

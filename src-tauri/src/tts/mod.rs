@@ -107,6 +107,18 @@ pub trait TtsBackend: Send + Sync {
     /// Check if the engine binary/server is reachable.
     fn health_check(&self) -> Result<(), TtsError>;
 
+    /// Whether the failure this backend just returned must not be retried by
+    /// the caller.
+    ///
+    /// The command layer retries transient failures twice. Some backends can
+    /// tell that a retry would only make things worse — Edge answers a retried
+    /// 429 with another 429 and escalates a *process-wide* cooldown, so three
+    /// attempts for one user action leave every later reading penalised.
+    /// Checked after an attempt fails, so it describes the most recent one.
+    fn failure_is_final(&self) -> bool {
+        false
+    }
+
     /// Whether this backend can produce audio incrementally via
     /// [`TtsBackend::synthesize_streaming`]. Defaults to false for batch-only
     /// backends; the command layer uses this to pick the streaming path.

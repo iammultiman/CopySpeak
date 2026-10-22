@@ -2,7 +2,7 @@
 """CLI wrapper for Piper (piper1-gpl) - used by CopySpeak.
 
 Reads text (inline or from a file), loads the Piper voice model named by
---voice (resolved as ../voices/<voice>.onnx relative to this wrapper), synthesizes,
+--voice (resolved from the engine environment's voices directory), synthesizes,
 and writes a WAV file.
 
 Invoked by CopySpeak via:
@@ -87,18 +87,13 @@ def read_text(args) -> str:
 
 
 def resolve_model(name: str, voices_dir_override: str | None = None) -> Path:
-    # Voices live in <engine_dir>/voices/, alongside the uv project — not next
-    # to this script. CopySpeak passes --voices-dir explicitly because
-    # __file__ is unreliable: a legacy profile launched the wrapper via a
-    # CWD-relative path ("scripts/copyspeak-piper.py"), so resolve() pinned it
-    # to the app install dir and voices were looked up there instead.
-    # Default keeps a manual `uv run ... python scripts/copyspeak-piper.py`
-    # invocation (cwd = <engine_dir>) working.
-    voices_dir = (
-        Path(voices_dir_override).expanduser()
-        if voices_dir_override
-        else Path(__file__).resolve().parent.parent / "voices"
-    )
+    project_voices = Path(sys.prefix).parent / "voices"
+    if voices_dir_override:
+        voices_dir = Path(voices_dir_override).expanduser()
+    elif Path(sys.prefix).name == ".venv" and project_voices.is_dir():
+        voices_dir = project_voices
+    else:
+        voices_dir = Path(__file__).resolve().parent.parent / "voices"
     # ponytail: resolve by exact basename, else first .onnx whose stem ends with the voice name.
     model = voices_dir / f"{name}.onnx"
     if model.exists():
@@ -285,7 +280,7 @@ def main() -> int:
     parser.add_argument("--voice", default="en_US-joe-medium", help="Voice model basename in voices/")
     parser.add_argument(
         "--voices-dir",
-        help="Directory holding <voice>.onnx (default: <engine_dir>/voices next to this wrapper)",
+        help="Directory holding <voice>.onnx (default: the uv project's voices dir)",
     )
     parser.add_argument("--output", help="Output WAV file path (required unless --serve)")
     parser.add_argument("--serve", action="store_true", help="Keep the model in RAM and read JSON requests on stdin")

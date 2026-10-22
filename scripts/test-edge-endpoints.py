@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""Endpoint-fallback tests for the Edge Read Aloud wrapper.
-
-The real `edge-tts` cannot be called from CI (it needs Microsoft's service and
-a region that still accepts the handshake), so these tests drive
-`copyspeak-edge.py` against a stub that records the URL it was asked to open and
-can be told to refuse it. That covers what the wrapper is responsible for:
-
-* which host each attempt targets,
-* the query parameter each host expects,
-* that a refusal on one host retries the other,
-* that a non-handshake failure is not retried,
-* that captions still come from the successful attempt's word boundaries.
-
-Run: python scripts/test-edge-endpoints.py
-"""
+"""Offline tests for Edge endpoint ownership, captions and private error metadata."""
 
 import asyncio
 import importlib.util
@@ -24,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -77,8 +64,7 @@ class FakeCommunicate:
 
 
 def install_stub():
-    """Install a fake `edge_tts` package whose communicate module carries the
-    7.2.8 import-bound globals the wrapper patches."""
+    """Install a fake client and verify the wrapper leaves its endpoint intact."""
     constants = types.ModuleType("edge_tts.constants")
     constants.TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
     constants.WSS_URL = (
@@ -111,7 +97,26 @@ WORDS = [
 ]
 
 
+def error_payload(stderr_text):
+    """The marker payload, which deliberately starts its own line."""
+    marker = [
+        line for line in stderr_text.splitlines() if line.startswith("[edge-error] ")
+    ]
+    assert len(marker) == 1, stderr_text
+    return json.loads(marker[0].removeprefix("[edge-error] "))
+
+
 class EdgeEndpointTests(unittest.TestCase):
+    def test_rate_limit_reports_only_safe_metadata(self):
+        error = HandshakeDenied(429)
+        error.headers = {"Retry-After": "17"}
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            wrapper.report_error(error)
+        line = stderr.getvalue().strip()
+        self.assertEqual(error_payload(line), {"kind": "http", "status": 429, "retry_after_seconds": 17})
+        self.assertNotIn("Invalid response", line)
+
     def setUp(self):
         self.enterContext(patch.dict(sys.modules))
         self.edge_tts, self.communicate = install_stub()
@@ -129,31 +134,22 @@ class EdgeEndpointTests(unittest.TestCase):
     def run_synthesize(self):
         asyncio.run(wrapper.synthesize(self.input_path, self.output_path, "en-US-AvaNeural"))
 
-    def test_legacy_host_is_used_first_and_needs_no_retry(self):
+    def test_upstream_endpoint_and_word_boundaries_are_preserved(self):
+        endpoint = self.communicate.WSS_URL
         self.run_synthesize()
         self.assertEqual([a[0] for a in FakeCommunicate.attempts], ["legacy"])
         host, url, boundary = FakeCommunicate.attempts[0]
-        # The legacy URL is the pinned one plus the query key it expects.
-        self.assertIn("speech.platform.bing.com", url)
-        self.assertIn("TrustedClientToken=", url)
-        self.assertIn("?", url)
+        self.assertEqual(url, endpoint)
         self.assertEqual(boundary, "WordBoundary")
-        # No subprotocol is added to the legacy attempt (7.2.8 sends none).
         self.assertNotIn("Sec-WebSocket-Protocol", self.communicate.WSS_HEADERS)
 
-    def test_refused_legacy_host_falls_back_to_current_host(self):
-        FakeCommunicate.refuse = {"legacy"}
+    def test_wrapper_does_not_override_client_selected_endpoint(self):
+        self.communicate.WSS_URL = "wss://client-selected.example/speech?version=2"
         self.run_synthesize()
-        self.assertEqual([a[0] for a in FakeCommunicate.attempts], ["legacy", "fallback"])
-        _, url, _ = FakeCommunicate.attempts[1]
-        self.assertIn("api.msedgeservices.com", url)
-        self.assertIn("Ocp-Apim-Subscription-Key=", url)
-        # Both hosts carry the same trusted-client token value.
-        self.assertIn("6A5AA1D4EAFF4E9FB37E23D68491D6F4", url)
+        self.assertEqual(FakeCommunicate.attempts[0][1], self.communicate.WSS_URL)
         self.assertEqual(self.communicate.WSS_HEADERS, self.edge_tts.constants.WSS_HEADERS)
 
-    def test_fallback_audio_and_captions_come_from_the_successful_attempt(self):
-        FakeCommunicate.refuse = {"legacy"}
+    def test_audio_and_captions_come_from_the_same_attempt(self):
         self.run_synthesize()
         self.assertEqual(Path(self.output_path).read_bytes(), b"\x01\x02\x03\x04")
         captions = json.loads(Path(self.output_path + ".captions.json").read_text(encoding="utf-8"))
@@ -163,17 +159,22 @@ class EdgeEndpointTests(unittest.TestCase):
         self.assertEqual(captions["words"][0]["start_ms"], 1.0)
         self.assertEqual(captions["words"][0]["end_ms"], 1.5)
 
-    def test_both_hosts_refused_surfaces_the_error(self):
-        FakeCommunicate.refuse = {"legacy", "fallback"}
+    def test_forbidden_is_not_retried_again_by_the_wrapper(self):
+        FakeCommunicate.refuse = {"legacy"}
         stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr), self.assertRaises(HandshakeDenied):
-            self.run_synthesize()
-        self.assertEqual([a[0] for a in FakeCommunicate.attempts], ["legacy", "fallback"])
-        self.assertIn("[edge] both-endpoints-denied: HTTP 403", stderr.getvalue())
+        # Drive the production entry point: `synthesize` alone writes no
+        # stderr, so asserting on it proved nothing about what Rust captures.
+        with contextlib.redirect_stderr(stderr):
+            code = wrapper.main([self.input_path, self.output_path, "en-US-AvaNeural"])
+        self.assertEqual(code, 1)
+        self.assertEqual([a[0] for a in FakeCommunicate.attempts], ["legacy"])
         self.assertFalse(Path(self.output_path).exists())
+        line = stderr.getvalue().strip()
+        self.assertEqual(error_payload(line), {"kind": "http", "status": 403})
+        self.assertNotIn("Invalid response", line)
 
     def test_non_403_stream_failure_is_not_retried(self):
-        for status in (401, 500):
+        for status in (401, 429, 500):
             with self.subTest(status=status):
                 FakeCommunicate.attempts = []
                 FakeCommunicate.failures = {"legacy": HandshakeDenied(status)}
@@ -184,17 +185,19 @@ class EdgeEndpointTests(unittest.TestCase):
     def test_partial_failed_attempt_is_discarded(self):
         FakeCommunicate.partial_hosts = {"legacy"}
         FakeCommunicate.refuse = {"legacy"}
-        self.run_synthesize()
-        self.assertEqual(Path(self.output_path).read_bytes(), b"\x01\x02\x03\x04")
-
-    def test_fallback_server_error_is_not_reported_as_two_403s(self):
-        FakeCommunicate.refuse = {"legacy"}
-        FakeCommunicate.failures = {"fallback": HandshakeDenied(500)}
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr), self.assertRaises(HandshakeDenied):
+        with self.assertRaises(HandshakeDenied):
             self.run_synthesize()
-        self.assertNotIn("both-endpoints-denied", stderr.getvalue())
         self.assertFalse(Path(self.output_path).exists())
+        self.assertFalse(Path(self.output_path + ".captions.json").exists())
+
+    def test_exception_context_and_arbitrary_messages_are_not_reported(self):
+        error = RuntimeError("private diagnostic and request parameters")
+        error.__context__ = HandshakeDenied(403)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            wrapper.report_error(error)
+        self.assertEqual(error_payload(stderr.getvalue()), {"kind": "failure"})
+        self.assertNotIn("private diagnostic", stderr.getvalue())
 
     def test_unrelated_failure_is_not_retried(self):
         class Other(Exception):
@@ -210,14 +213,45 @@ class EdgeEndpointTests(unittest.TestCase):
             self.run_synthesize()
         self.assertEqual(FakeCommunicate.attempts, [])
 
-    def test_handshake_denied_matches_the_real_error_shapes(self):
-        self.assertTrue(wrapper.handshake_denied(HandshakeDenied()))
-        self.assertFalse(wrapper.handshake_denied(HandshakeDenied(401)))
-        self.assertFalse(wrapper.handshake_denied(HandshakeDenied(500)))
-        self.assertFalse(wrapper.handshake_denied(Exception("403, message='Invalid response status'")))
-        self.assertFalse(wrapper.handshake_denied(Exception("Invalid response status")))
-        self.assertFalse(wrapper.handshake_denied(Exception("No audio was received")))
-        self.assertFalse(wrapper.handshake_denied(Exception("timeout")))
+    def test_retry_after_dates_and_invalid_values(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.assertEqual(wrapper.retry_after_seconds("Thu, 01 Jan 2026 00:00:20 GMT", now), 20)
+        self.assertEqual(wrapper.retry_after_seconds("Wed, 31 Dec 2025 23:59:59 GMT", now), 0)
+        for value in (None, "invalid", "-1", "1.5", "inf"):
+            self.assertIsNone(wrapper.retry_after_seconds(value, now))
+
+    def test_transport_failures_are_classified_by_family(self):
+        class ClientConnectionError(Exception):
+            pass
+
+        class ClientConnectorDNSError(ClientConnectionError):
+            pass
+
+        class ServerDisconnectedError(Exception):
+            pass
+
+        for error in (ClientConnectionError(), ClientConnectorDNSError(), ServerDisconnectedError()):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                wrapper.report_error(error)
+            self.assertEqual(error_payload(stderr.getvalue()), {"kind": "connection"})
+
+    def test_marker_starts_a_line_even_after_a_partial_line(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            stderr.write("partial")
+            wrapper.report_error(HandshakeDenied(403))
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(lines[0], "partial")
+        self.assertTrue(lines[-1].startswith("[edge-error] "))
+
+    def test_final_status_wins_over_exception_context(self):
+        error = HandshakeDenied(429)
+        error.__context__ = HandshakeDenied(403)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            wrapper.report_error(error)
+        self.assertEqual(error_payload(stderr.getvalue()), {"kind": "http", "status": 429})
 
 
 if __name__ == "__main__":

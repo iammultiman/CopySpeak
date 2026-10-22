@@ -343,20 +343,30 @@ impl CliTtsBackend {
             args = kept;
         }
 
-        // Piper resolves its voice models from <engine_dir>/voices/, not next
-        // to its wrapper. That works because the first-class Piper template
-        // points at an absolute `{engine_dir}/piper/scripts/copyspeak-piper.py`,
-        // so `Path(__file__)` lands inside the engine dir. The legacy bug was a
-        // *CWD-relative* template ("scripts/copyspeak-piper.py") run from the
-        // app install dir, which made the wrapper look for voices there and
-        // report "voice model not found ... Available: []"; the v7 migration
-        // promotes those profiles onto the absolute template.
+        // A managed Piper profile imported before the first-class engine
+        // existed can still name its wrapper as a *CWD-relative* path
+        // ("scripts/copyspeak-piper.py"). `--project` does not relocate it, so
+        // the wrapper resolved `voices/` against the app install directory and
+        // reported "voice model not found ... Available: []". The config
+        // migration repairs profiles it sees, but cannot reach one imported
+        // after it ran, so repair the known managed shape at launch too.
         //
-        // The wrapper also accepts `--voices-dir`, but it is deliberately NOT
-        // injected here: installed wrappers are copies made at install time, so
-        // an older copy would abort with "unrecognized arguments" and take the
-        // whole engine offline. Passing the flag is left to callers who know
-        // their wrapper supports it.
+        // Matched on the full managed invocation, not on a filename substring,
+        // so a hand-written local CLI that merely mentions the wrapper keeps
+        // exactly what the user configured. `--voices-dir` is still not
+        // injected: installed wrappers are copies from install time, and an
+        // older copy would abort with "unrecognized arguments".
+        let managed_piper = format!("{engine_dir}/piper");
+        if self.command.trim() == "uv"
+            && args.len() >= 5
+            && args[0] == "run"
+            && args[1] == "--project"
+            && args[2].replace('\\', "/") == managed_piper.replace('\\', "/")
+            && args[3] == "python"
+            && args[4].replace('\\', "/") == "scripts/copyspeak-piper.py"
+        {
+            args[4] = format!("{managed_piper}/scripts/copyspeak-piper.py");
+        }
 
         // Our own wrappers understand --device; third-party CLIs do not, so the
         // flag is only added for engines we ship a wrapper for. When cuda is off
@@ -916,6 +926,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_piper_relative_wrapper_uses_installed_engine_path() {
+        let backend = CliTtsBackend::new(
+            "uv".into(),
+            vec![
+                "run".into(),
+                "--project".into(),
+                "{engine_dir}/piper".into(),
+                "python".into(),
+                "scripts/copyspeak-piper.py".into(),
+                "--voice".into(),
+                "{voice}".into(),
+            ],
+        );
+        let args = backend.build_args("input", "output", "en_US-lessac-medium", "test");
+        assert_eq!(
+            args[4],
+            format!(
+                "{}/piper/scripts/copyspeak-piper.py",
+                CliTtsBackend::engine_dir()
+            )
+        );
+    }
+
+    #[test]
+    fn piper_custom_project_is_not_rewritten() {
+        let backend = CliTtsBackend::new(
+            "uv".into(),
+            vec![
+                "run".into(),
+                "--project".into(),
+                "custom-project".into(),
+                "python".into(),
+                "scripts/copyspeak-piper.py".into(),
+            ],
+        );
+        assert_eq!(
+            backend.build_args("input", "output", "voice", "text")[4],
+            "scripts/copyspeak-piper.py"
+        );
+    }
+
+    #[test]
     fn test_build_args_replaces_placeholders() {
         let backend = CliTtsBackend::new(
             "test-tts".into(),
@@ -983,7 +1035,13 @@ mod tests {
             ],
         );
         let args = piper.build_args("in.txt", "out.wav", "en_US-amy-medium", "");
-        assert_eq!(args[1], format!("{}/piper/scripts/copyspeak-piper.py", CliTtsBackend::engine_dir()));
+        assert_eq!(
+            args[1],
+            format!(
+                "{}/piper/scripts/copyspeak-piper.py",
+                CliTtsBackend::engine_dir()
+            )
+        );
         assert!(std::path::Path::new(&args[1]).is_absolute());
     }
 

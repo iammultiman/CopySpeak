@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-10-22
+
+### Fixed
+
+- Update the embedded Edge client to `edge-tts==7.3.1` and use its upstream
+  handshake instead of the older alternate-host override. Availability still
+  depends on Microsoft's service.
+- Preserve Edge HTTP 429 cooldowns across replacement readings. Requests share
+  a one-second start spacing; throttling uses `Retry-After` when provided or
+  increasing 5/10/20/40-second delays capped at 60 seconds. Server-requested
+  delays are capped at five minutes so a malformed header cannot disable the
+  engine for the process lifetime. Waiting is
+  cancellable and limited to 30 seconds per attempt; longer cooldowns remain in
+  force and ask for a later retry. A provider refusal is reported once instead
+  of being retried, which used to escalate the shared cooldown for a single
+  reading (three attempts, three strikes).
+- Keep the Engines-page Edge test working after a Stop. The health check no
+  longer reads the abort flags, which stay set until the next reading, so a test
+  click is not answered with "Reading cancelled". The shared cooldown still
+  applies to it.
+- Surface allowlisted Edge failure metadata rather than raw subprocess output,
+  tracebacks, local paths, or generated request URLs.
+- Collect Edge audio and captions under the same request lock so a concurrent
+  setup test cannot replace a reading's captions. Successful synthesis preserves
+  the original start-spacing deadline without adding a delay after completion.
+- Repair relative wrapper paths for managed Piper uv projects at launch, even
+  when the profile migration already ran. Current wrappers prefer voices beside
+  their engine environment; explicit voice-directory overrides are preserved.
+  Existing installed wrappers need a non-destructive installer rerun to refresh.
+
 ### Documentation
 
 - Identify X-CopySpeak as the maintained fork, document the changes through

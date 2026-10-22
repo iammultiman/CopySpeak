@@ -13,7 +13,7 @@ pitch + effect as one swappable unit.
 
 | Engine             | Type   | API key        | Offline | Live captions | Installer                       | Setup test               |
 | ------------------ | ------ | -------------- | ------- | ------------- | ------------------------------- | ------------------------ |
-| Edge-TTS           | cloud  | no             | no      | yes           | — (`uv tool install edge-tts`)  | `test_tts_engine_config` |
+| Edge-TTS           | cloud  | no             | no      | yes           | — (`uv run --with edge-tts`)    | `test_tts_engine_config` |
 | Cartesia (Sonic)   | cloud  | yes            | no      | yes           | —                               | `test_tts_engine_config` |
 | ElevenLabs         | cloud  | yes            | no      | yes           | —                               | `test_tts_engine_config` |
 | OpenAI             | cloud  | yes            | no      | no            | —                               | `test_tts_engine_config` |
@@ -30,9 +30,10 @@ pitch + effect as one swappable unit.
 
 Each cloud tab on the Engine page takes an API key (Microsoft also takes an
 endpoint). Click **Test Setup** to synthesize a short clip with the engine's
-default voice and confirm the credential works. Edge-TTS is the exception:
-it needs no key, but its CLI must be on PATH first
-(`uv tool install edge-tts`).
+default voice and confirm the credential works. Edge-TTS is the exception: it
+needs no key and nothing installed separately — the app runs the pinned client
+through `uv run --no-project --with edge-tts==7.3.1`, so it only needs `uv`
+(which the installer bootstraps) and network access to Microsoft's service.
 
 | Engine            | Where to get credentials                      |
 | ----------------- | --------------------------------------------- |
@@ -72,14 +73,14 @@ Common flags: `-Force` (reinstall), `-SmokeTest` (synthesize one clip),
 | Pocket TTS | `install-pocket.ps1`    | 100M params | Kyutai Pocket; 14 voices in 6 languages. CPU-first.            |
 | Qwen3-TTS  | `install-qwen.ps1`      | —           | Multilingual; 9 built-in voices; model downloads on first use. |
 
-(Edge-TTS is uv-managed too but has no installer script — install its CLI
-with `uv tool install edge-tts`.)
+(Edge-TTS is uv-managed too but has no installer script: it runs through
+`uv run --no-project --with edge-tts==7.3.1` and needs no separate
+`uv tool install`.)
 
 Manual run (if you prefer the terminal):
 
 ```powershell
 ./scripts/install-uv.ps1            # one-time uv bootstrap
-uv tool install edge-tts            # edge-tts CLI (no app installer)
 ./scripts/test-engine.ps1 -Engine pocket       # verify any installed engine
 ```
 

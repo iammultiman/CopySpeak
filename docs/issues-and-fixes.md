@@ -1,6 +1,38 @@
 # X-CopySpeak: Reported Issues, Findings, and Fixes
 
-Last updated: 2026-10-16. Current fork build: **X-CopySpeak 0.2.14**.
+Last updated: 2026-10-22. Latest delivered fork build: **X-CopySpeak 0.2.14**.
+
+## 0.2.15 Engine Recovery Follow-up
+
+The latest reports include Edge throttling after a retrigger and Piper looking
+for installed voices beside the application rather than its engine. Personal
+paths, request URLs, and connection identifiers are intentionally omitted.
+
+Edge's final status was HTTP 429 after the older fallback ran. This suggests
+throttling but does not identify a quota or prove that retriggering caused it.
+Version 0.2.15 pins the upstream 7.3.1 handshake implementation and removes the
+old endpoint override. A process-wide cooldown survives backend recreation and
+cancel/retrigger, honors `Retry-After`, and otherwise grows from 5 to 10 to 20
+seconds, capped at 60 seconds. Request starts are spaced by at least one second.
+Waits poll cancellation and have a 30-second per-attempt budget; a longer server
+delay is retained up to a five-minute ceiling without automatically reconnecting
+early. Edge 403/429 refusals are final for that request; other transient synthesis
+failures still permit at most three attempts. Cooldown state lasts for this app process,
+not across application restarts. The UI reports the normal synthesis state;
+safe status/cooldown diagnostics are logged without raw traceback contents.
+
+The earlier Piper profile migration matched only exact templates and ran once.
+The launcher repair narrowly resolves the relative wrapper used with
+the managed uv project even when that migration has already run. It preserves
+custom projects and arguments. Updated wrappers resolve voices beside their uv
+environment before using the script-relative manual fallback; an explicit
+`--voices-dir` is authoritative. Re-run the Piper installer without a forced
+reinstall to refresh a previously copied wrapper while retaining models.
+
+Offline regressions exercise these code paths; neither reported failure has
+yet been verified as resolved in the installed Windows application. These
+changes are not included in the existing 0.2.14 installer, and do not provide
+automatic failed-section resume or guarantee Microsoft service availability.
 
 ## Fork Improvement Summary
 
@@ -220,6 +252,13 @@ request or that playback succeeds. Needs a live test.
 
 ### 11. Edge-TTS 403 on the Legacy Host
 
+> **Superseded on 2026-10-22.** `edge-tts` 7.3.0/7.3.1 (published 2026-10-13)
+> moved Read Aloud to Microsoft's current host and handle the 403 skew retry
+> themselves, so the alternate-host override described below was removed and
+> the pin advanced to 7.3.1. The reasoning that follows explains why the
+> workaround existed; it is not the current implementation. See **Unreleased
+> Engine Recovery Follow-up** at the top of this file.
+
 **Report:** after Kokoro felt slow, the user switched to Edge, which then failed
 with `WSServerHandshakeError: 403` and `Sec-MS-GEC-Version=1-143.0.3650.75`. They
 later received third-party advice to upgrade `edge-tts` / clear the `uv` cache,
@@ -234,7 +273,9 @@ conclusion was right, but "the engine cannot be fixed locally" was **wrong**.
   ([edge.rs](../src-tauri/src/tts/edge.rs)). Nothing is installed into a project
   environment and no `edge-tts` is on `PATH`, so an upgrade or cache refresh has
   no target.
-- **7.2.8 is already the newest release**, so there is no newer fix to fetch.
+- **7.2.8 was the newest release at the time**, so there was no newer fix to
+  fetch from the version the app pinned. (7.3.0 and 7.3.1 later shipped the
+  upstream fix; the pin now follows them.)
 - The failure is **regional**: several EU users are at 100% failure while North
   American users are unaffected, and the HuggingFace Space that still works is
   `region: us`. That is why the reports disagree.
@@ -264,7 +305,8 @@ conclusion was right, but "the engine cannot be fixed locally" was **wrong**.
 - An explicit wrapper marker reports **both** hosts returning 403, so an unrelated
   failure is not mislabeled as a regional double refusal.
 
-**Status:** implemented; endpoint selection and error handling are covered by
+**Status (historical):** superseded — see the note at the top of this section.
+When written, endpoint selection and error handling were covered by
 the [endpoint tests](../scripts/test-edge-endpoints.py) against a stub. A live
 Codespaces probe on 2026-10-11 using 7.2.8, unchanged headers, and
 `en-US-AvaMultilingualNeural` returned audio and six word boundaries from both
