@@ -13,7 +13,7 @@
     onExportSelected,
     disabled = false,
     class: className
-  } = $props<{
+  }: {
     totalItems: number;
     selectedCount: number;
     isAllSelected: boolean;
@@ -24,7 +24,7 @@
     onExportSelected: () => void;
     disabled?: boolean;
     class?: string;
-  }>();
+  } = $props();
 
   let showDeleteConfirm = $state(false);
 

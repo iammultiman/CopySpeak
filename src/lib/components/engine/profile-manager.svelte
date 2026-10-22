@@ -35,7 +35,7 @@
     VoiceProfile
   } from "$lib/types";
 
-  let { localConfig = $bindable() } = $props<{ localConfig: AppConfig }>();
+  let { localConfig = $bindable() }: { localConfig: AppConfig } = $props();
 
   const ENGINES: TtsEngine[] = [
     "local",
@@ -466,7 +466,7 @@
     const profile = localConfig.tts.profiles[index];
     profile.voice = voiceId;
     const match = catalogVoicesFor(profile.engine).find((voice) => voice.id === voiceId);
-    profile.voice_label = match?.label;
+    profile.voice_label = match?.label ?? null;
   }
 
   function resetEngineOptions(index: number, engine: TtsEngine) {

@@ -34,7 +34,7 @@
     onPlay,
     onReSpeak,
     onDelete
-  } = $props<{
+  }: {
     entry: HistoryItem;
     onCopy?: (text: string) => void;
     showCopySuccess?: boolean;
@@ -42,7 +42,7 @@
     onPlay?: (entry: HistoryItem) => void;
     onReSpeak?: (entry: HistoryItem) => void;
     onDelete?: (entry: HistoryItem) => void;
-  }>();
+  } = $props();
 
   function truncateText(text: string, maxLength: number): string {
     if (text.length <= maxLength) return text;

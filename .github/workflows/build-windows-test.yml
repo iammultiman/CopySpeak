@@ -10,6 +10,7 @@ on:
       - ".github/workflows/build-windows-test.yml"
       - "package.json"
       - "src/lib/version.ts"
+      - "src/**"
 
 permissions:
   contents: read

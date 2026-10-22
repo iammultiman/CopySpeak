@@ -7,12 +7,12 @@
     onchange,
     class: className,
     ...props
-  } = $props<{
+  }: {
     checked?: boolean;
     disabled?: boolean;
     onchange?: (event: Event) => void;
     class?: string;
-  }>();
+  } = $props();
 
   // svelte-ignore state_referenced_locally
   let internalChecked = $state(checked);

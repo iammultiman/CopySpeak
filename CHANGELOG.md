@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Use declaration annotations for Svelte component props so clean dependency
+  installs pass type checking; correct nullable voice labels and the legacy
+  Post-Processing component's input contract exposed by those annotations.
 - Update the embedded Edge client to `edge-tts==7.3.1` and use its upstream
   handshake instead of the older alternate-host override. Availability still
   depends on Microsoft's service.

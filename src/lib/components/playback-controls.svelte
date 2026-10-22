@@ -6,17 +6,25 @@
 
   type PlayMode = "play" | "replay" | "history" | "disabled";
 
-  let { isPlaying, isPaused, isSynthesizing, playMode, onPlay, onStop, onAbort, onTogglePause } =
-    $props<{
-      isPlaying: boolean;
-      isPaused: boolean;
-      isSynthesizing: boolean;
-      playMode: PlayMode;
-      onPlay: () => void;
-      onStop: () => void;
-      onAbort: () => void;
-      onTogglePause: () => void;
-    }>();
+  let {
+    isPlaying,
+    isPaused,
+    isSynthesizing,
+    playMode,
+    onPlay,
+    onStop,
+    onAbort,
+    onTogglePause
+  }: {
+    isPlaying: boolean;
+    isPaused: boolean;
+    isSynthesizing: boolean;
+    playMode: PlayMode;
+    onPlay: () => void;
+    onStop: () => void;
+    onAbort: () => void;
+    onTogglePause: () => void;
+  } = $props();
 
   const canStop = $derived(isPlaying || isSynthesizing);
 </script>

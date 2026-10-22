@@ -10,13 +10,14 @@
   import { Textarea } from "$lib/components/ui/textarea/index.js";
 
   import type {
-    AppConfig,
+    PostProcessingConfig,
     LlmProviderConfig,
     PostProcessingPromptPreset,
     PostProcessingProvider
   } from "$lib/types";
 
-  let { localConfig = $bindable() } = $props<{ localConfig: AppConfig }>();
+  let { localConfig = $bindable() }: { localConfig: { post_processing: PostProcessingConfig } } =
+    $props();
 
   const providerOptions = [
     { value: "groq", label: "Groq" },
