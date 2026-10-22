@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - main
       - "fix/**"
     paths:
       - ".github/workflows/build-windows-test.yml"
